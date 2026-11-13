@@ -165,6 +165,22 @@ and if so, break out of any processing the server is currently doing.
                 });
     }
 
+Compression
+===========
+
+Record batch and dictionary batch bodies can be compressed with ZSTD or LZ4_FRAME
+by passing an ``IpcOption`` to ``start``, on either the server (DoGet, DoExchange)
+or the client (DoPut, DoExchange). This is equivalent to PyArrow's
+``pa.ipc.IpcWriteOptions(compression="zstd")``.
+
+.. code-block:: Java
+
+    listener.start(root, dictionaries,
+        IpcOption.DEFAULT.withCompression(CompressionUtil.CodecType.ZSTD));
+
+Codecs are provided by the ``arrow-compression`` module, which must be on the
+classpath of writers and readers. ``FlightStream`` decompresses automatically.
+
 Enabling TLS
 ============
 

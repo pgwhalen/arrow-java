@@ -22,6 +22,7 @@ import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
+import org.apache.arrow.vector.compression.CompressionCodec;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.ipc.message.IpcOption;
 
@@ -54,9 +55,22 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
   @Override
   public void start(VectorSchemaRoot root, DictionaryProvider dictionaries, IpcOption option) {
     this.option = option;
+    final CompressionCodec codec = createCodec(option);
     try {
       DictionaryUtils.generateSchemaMessages(
-          root.getSchema(), descriptor, dictionaries, option, responseObserver::onNext);
+          root.getSchema(),
+          descriptor,
+          dictionaries,
+          option,
+          codec,
+          message -> {
+            if (message.getMessageType() == ArrowMessage.HeaderType.DICTIONARY_BATCH) {
+              // As in putNext: otherwise a not-yet-connected client call may serialize the
+              // message after it is closed, and a compressed body owns its only buffer reference.
+              waitUntilStreamReady();
+            }
+            responseObserver.onNext(message);
+          });
     } catch (RuntimeException e) {
       // Propagate runtime exceptions, like those raised when trying to write unions with V4
       // metadata
@@ -68,7 +82,15 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
       throw new RuntimeException("Could not generate and send all schema messages", e);
     }
     // We include the null count and align buffers to be compatible with Flight/C++
-    unloader = new VectorUnloader(root, /* includeNullCount */ true, /* alignBuffers */ true);
+    unloader =
+        new VectorUnloader(root, /* includeNullCount */ true, codec, /* alignBuffers */ true);
+  }
+
+  private static CompressionCodec createCodec(IpcOption option) {
+    final CompressionCodec.Factory factory = CompressionCodec.Factory.INSTANCE;
+    return option.getCompressionLevel().isPresent()
+        ? factory.createCodec(option.getCodecType(), option.getCompressionLevel().get())
+        : factory.createCodec(option.getCodecType());
   }
 
   @Override

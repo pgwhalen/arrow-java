@@ -1,0 +1,489 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.arrow.flight;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import com.google.protobuf.ByteString;
+import io.grpc.EquivalentAddressGroup;
+import io.grpc.ManagedChannel;
+import io.grpc.NameResolver;
+import io.grpc.Server;
+import io.grpc.netty.NettyChannelBuilder;
+import io.grpc.netty.NettyServerBuilder;
+import io.grpc.stub.StreamObserver;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+import java.net.URI;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.stream.Stream;
+import org.apache.arrow.flatbuf.Message;
+import org.apache.arrow.flatbuf.MessageHeader;
+import org.apache.arrow.flight.impl.Flight;
+import org.apache.arrow.flight.impl.FlightServiceGrpc;
+import org.apache.arrow.memory.ArrowBuf;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.util.AutoCloseables;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.ValueVector;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.compression.CompressionUtil.CodecType;
+import org.apache.arrow.vector.dictionary.Dictionary;
+import org.apache.arrow.vector.dictionary.DictionaryEncoder;
+import org.apache.arrow.vector.dictionary.DictionaryProvider;
+import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
+import org.apache.arrow.vector.ipc.message.IpcOption;
+import org.apache.arrow.vector.ipc.message.MessageSerializer;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.DictionaryEncoding;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.types.pojo.Schema;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
+
+/** Tests that Flight writers compress IPC bodies as requested by {@link IpcOption}. */
+public class TestFlightCompression {
+
+  private static final byte[] COMMAND = "data".getBytes(StandardCharsets.UTF_8);
+  private static final int ROWS = 10_000;
+  private static final int BATCHES = 2;
+  private static final String[] DICTIONARY_VALUES = {"alpha", "beta", "gamma", "delta", "epsilon"};
+  private static final DictionaryEncoding ENCODING =
+      new DictionaryEncoding(1L, /* ordered */ false, new ArrowType.Int(32, true));
+  private static final Schema SCHEMA =
+      new Schema(
+          Arrays.asList(
+              Field.notNullable("i", new ArrowType.Int(32, true)),
+              new Field(
+                  "encoded",
+                  new FieldType(true, new ArrowType.Int(32, true), ENCODING),
+                  Collections.emptyList())));
+
+  private BufferAllocator allocator;
+  private Producer producer;
+  private FlightServer server;
+  private FlightClient client;
+
+  @BeforeEach
+  public void setUp() throws Exception {
+    allocator = new RootAllocator(Long.MAX_VALUE);
+    producer = new Producer(allocator);
+    server =
+        FlightServer.builder(
+                allocator, Location.forGrpcInsecure(FlightTestUtil.LOCALHOST, 0), producer)
+            .build()
+            .start();
+    client = newClient(server.getPort());
+  }
+
+  @AfterEach
+  public void tearDown() throws Exception {
+    // Closing the allocator fails the test if any (compressed) buffer was leaked.
+    AutoCloseables.close(client, server, allocator);
+  }
+
+  static Stream<IpcOption> options() {
+    return Stream.of(
+        IpcOption.DEFAULT,
+        IpcOption.DEFAULT.withCompression(CodecType.ZSTD),
+        IpcOption.DEFAULT.withCompression(CodecType.ZSTD, 7),
+        IpcOption.DEFAULT.withCompression(CodecType.LZ4_FRAME));
+  }
+
+  @ParameterizedTest
+  @MethodSource("options")
+  public void testDoGet(IpcOption option) throws Exception {
+    producer.option = option;
+    try (final FlightStream stream = client.getStream(new Ticket(COMMAND))) {
+      verifyStream(stream);
+    }
+  }
+
+  @ParameterizedTest
+  @MethodSource("options")
+  public void testDoPut(IpcOption option) throws Exception {
+    try (final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
+        final VectorSchemaRoot root = createRoot(allocator)) {
+      final FlightClient.ClientStreamListener listener =
+          client.startPut(FlightDescriptor.command(COMMAND), new AsyncPutListener());
+      writeStream(listener, root, provider, option);
+      listener.getResult();
+    }
+    assertEquals(BATCHES, producer.verifiedPutBatches);
+  }
+
+  @ParameterizedTest
+  @MethodSource("options")
+  public void testDoExchange(IpcOption option) throws Exception {
+    producer.option = option;
+    try (final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
+        final VectorSchemaRoot root = createRoot(allocator);
+        final FlightClient.ExchangeReaderWriter exchange =
+            client.doExchange(FlightDescriptor.command(COMMAND))) {
+      // The server echoes what the client writes; both sides compress with the same option.
+      writeStream(exchange.getWriter(), root, provider, option);
+      verifyStream(exchange.getReader());
+    }
+  }
+
+  /** A server writing DoGet compresses dictionary batches and record batches. */
+  @ParameterizedTest
+  @MethodSource("options")
+  public void testServerWireFormat(IpcOption option) throws Exception {
+    producer.option = option;
+    final List<Flight.FlightData> messages = new ArrayList<>();
+    final ManagedChannel channel =
+        NettyChannelBuilder.forAddress(FlightTestUtil.LOCALHOST, server.getPort())
+            .usePlaintext()
+            .build();
+    try {
+      FlightServiceGrpc.newBlockingStub(channel)
+          .doGet(Flight.Ticket.newBuilder().setTicket(ByteString.copyFrom(COMMAND)).build())
+          .forEachRemaining(messages::add);
+    } finally {
+      channel.shutdownNow().awaitTermination(30, TimeUnit.SECONDS);
+    }
+    verifyWireFormat(option, messages);
+  }
+
+  /** A client writing DoPut compresses dictionary batches and record batches. */
+  @ParameterizedTest
+  @MethodSource("options")
+  public void testClientWireFormat(IpcOption option) throws Exception {
+    final List<Flight.FlightData> messages = Collections.synchronizedList(new ArrayList<>());
+    final Server rawServer =
+        NettyServerBuilder.forAddress(new InetSocketAddress(FlightTestUtil.LOCALHOST, 0))
+            .addService(new CapturingFlightService(messages))
+            .build()
+            .start();
+    try (final FlightClient rawClient = newClient(rawServer.getPort());
+        final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
+        final VectorSchemaRoot root = createRoot(allocator)) {
+      final FlightClient.ClientStreamListener listener =
+          rawClient.startPut(FlightDescriptor.command(COMMAND), new AsyncPutListener());
+      writeStream(listener, root, provider, option);
+      listener.getResult();
+    } finally {
+      rawServer.shutdownNow().awaitTermination(30, TimeUnit.SECONDS);
+    }
+    verifyWireFormat(option, messages);
+  }
+
+  /**
+   * A client may start writing, including compressed dictionaries, before its call is connected, in
+   * which case gRPC queues messages to serialize later. They must not be freed before that.
+   */
+  @Test
+  public void testClientWritesBeforeConnected() throws Exception {
+    final IpcOption option = IpcOption.DEFAULT.withCompression(CodecType.ZSTD);
+    final ManualNameResolver resolver =
+        new ManualNameResolver(new InetSocketAddress(FlightTestUtil.LOCALHOST, server.getPort()));
+    final ManagedChannel channel =
+        NettyChannelBuilder.forTarget("manual:///flight")
+            .nameResolverFactory(resolver.factory())
+            .usePlaintext()
+            .build();
+    try (final FlightClient pendingClient = FlightGrpcUtils.createFlightClient(allocator, channel);
+        final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
+        final VectorSchemaRoot root = createRoot(allocator)) {
+      final FlightClient.ClientStreamListener listener =
+          pendingClient.startPut(FlightDescriptor.command(COMMAND), new AsyncPutListener());
+      final CompletableFuture<Void> writer =
+          CompletableFuture.runAsync(() -> writeStream(listener, root, provider, option));
+      // The writer cannot finish until the call is connected, which requires name resolution.
+      assertThrows(TimeoutException.class, () -> writer.get(1, TimeUnit.SECONDS));
+      resolver.resolve();
+      writer.get(30, TimeUnit.SECONDS);
+      listener.getResult();
+    } finally {
+      channel.shutdownNow().awaitTermination(30, TimeUnit.SECONDS);
+    }
+    assertEquals(BATCHES, producer.verifiedPutBatches);
+  }
+
+  private FlightClient newClient(int port) {
+    return FlightClient.builder(allocator, Location.forGrpcInsecure(FlightTestUtil.LOCALHOST, port))
+        .build();
+  }
+
+  private static DictionaryProvider.MapDictionaryProvider createProvider(
+      BufferAllocator allocator) {
+    final VarCharVector dictionary = new VarCharVector("dictionary", allocator);
+    dictionary.allocateNew();
+    for (int i = 0; i < DICTIONARY_VALUES.length; i++) {
+      dictionary.setSafe(i, DICTIONARY_VALUES[i].getBytes(StandardCharsets.UTF_8));
+    }
+    dictionary.setValueCount(DICTIONARY_VALUES.length);
+    return new DictionaryProvider.MapDictionaryProvider(new Dictionary(dictionary, ENCODING));
+  }
+
+  private static String expectedValue(int row) {
+    return row % 11 == 0 ? null : DICTIONARY_VALUES[row % DICTIONARY_VALUES.length];
+  }
+
+  /** Create a root holding a highly compressible batch. */
+  private static VectorSchemaRoot createRoot(BufferAllocator allocator) {
+    final VectorSchemaRoot root = VectorSchemaRoot.create(SCHEMA, allocator);
+    final IntVector ints = (IntVector) root.getVector("i");
+    final IntVector indices = (IntVector) root.getVector("encoded");
+    ints.allocateNew(ROWS);
+    indices.allocateNew(ROWS);
+    for (int row = 0; row < ROWS; row++) {
+      ints.set(row, row % 16);
+      if (expectedValue(row) != null) {
+        indices.set(row, row % DICTIONARY_VALUES.length);
+      }
+    }
+    root.setRowCount(ROWS);
+    return root;
+  }
+
+  /**
+   * Send the root {@link #BATCHES} times, then complete the stream.
+   *
+   * <p>Callers create the root before the call, so that a client starts writing (including
+   * compressed dictionaries) while its call may not be connected yet.
+   */
+  private static void writeStream(
+      OutboundStreamListener listener,
+      VectorSchemaRoot root,
+      DictionaryProvider provider,
+      IpcOption option) {
+    listener.start(root, provider, option);
+    for (int batch = 0; batch < BATCHES; batch++) {
+      listener.putNext();
+    }
+    listener.completed();
+  }
+
+  /** Read and verify the batches written by {@link #writeStream}. */
+  private static void verifyStream(FlightStream stream) {
+    int batches = 0;
+    while (stream.next()) {
+      final VectorSchemaRoot root = stream.getRoot();
+      assertEquals(ROWS, root.getRowCount());
+      final IntVector ints = (IntVector) root.getVector("i");
+      final Dictionary dictionary = stream.getDictionaryProvider().lookup(ENCODING.getId());
+      try (final ValueVector decoded =
+          DictionaryEncoder.decode(root.getVector("encoded"), dictionary)) {
+        for (int row = 0; row < ROWS; row++) {
+          assertEquals(row % 16, ints.get(row));
+          final Object value = decoded.getObject(row);
+          if (!Objects.equals(expectedValue(row), value == null ? null : value.toString())) {
+            throw new AssertionError("Row " + row + " differs: " + value);
+          }
+        }
+      }
+      batches++;
+    }
+    assertEquals(BATCHES, batches);
+  }
+
+  /**
+   * Check the FlightData messages of a stream written by {@link #writeStream}, exactly as sent: a
+   * schema, a dictionary batch, then record batches, with every batch compressed by the requested
+   * codec.
+   */
+  private void verifyWireFormat(IpcOption option, List<Flight.FlightData> messages)
+      throws Exception {
+    final List<Flight.FlightData> data = new ArrayList<>();
+    for (Flight.FlightData message : messages) {
+      if (!message.getDataHeader().isEmpty()) {
+        data.add(message);
+      }
+    }
+    assertEquals(2 + BATCHES, data.size());
+    assertEquals(MessageHeader.Schema, header(data.get(0)).headerType());
+    assertEquals(MessageHeader.DictionaryBatch, header(data.get(1)).headerType());
+    for (Flight.FlightData message : data.subList(1, data.size())) {
+      try (final ArrowRecordBatch batch = deserializeBatch(message)) {
+        assertEquals(
+            option.getCodecType(),
+            CodecType.fromCompressionType(batch.getBodyCompression().getCodec()));
+        if (header(message).headerType() == MessageHeader.RecordBatch
+            && option.getCodecType() != CodecType.NO_COMPRESSION) {
+          // Buffers are i (validity, data), encoded (validity, data). A compressed buffer is
+          // prefixed by its uncompressed length, or -1 if it was left uncompressed.
+          final ArrowBuf intData = batch.getBuffers().get(1);
+          assertEquals((long) ROWS * Integer.BYTES, intData.getLong(0));
+          assertTrue(intData.readableBytes() < ROWS * Integer.BYTES / 4);
+        }
+      }
+    }
+  }
+
+  private static Message header(Flight.FlightData data) {
+    return Message.getRootAsMessage(data.getDataHeader().asReadOnlyByteBuffer());
+  }
+
+  /** Deserialize a record batch or dictionary batch without decompressing its buffers. */
+  private ArrowRecordBatch deserializeBatch(Flight.FlightData data) throws Exception {
+    final Message message = header(data);
+    final ByteBuffer bodyBytes =
+        data.getDataBody().asReadOnlyByteBuffer().order(ByteOrder.LITTLE_ENDIAN);
+    // The deserialized batch takes ownership of the body.
+    final ArrowBuf body = allocator.buffer(bodyBytes.remaining());
+    try {
+      body.setBytes(0, bodyBytes);
+      body.writerIndex(data.getDataBody().size());
+      return message.headerType() == MessageHeader.RecordBatch
+          ? MessageSerializer.deserializeRecordBatch(message, body)
+          : MessageSerializer.deserializeDictionaryBatch(message, body).getDictionary();
+    } catch (Exception e) {
+      body.close();
+      throw e;
+    }
+  }
+
+  /** Writes with the configured option; verifies DoPut data; echoes DoExchange data. */
+  static class Producer extends NoOpFlightProducer {
+    private final BufferAllocator allocator;
+    volatile IpcOption option = IpcOption.DEFAULT;
+    volatile int verifiedPutBatches = 0;
+
+    Producer(BufferAllocator allocator) {
+      this.allocator = allocator;
+    }
+
+    @Override
+    public void getStream(CallContext context, Ticket ticket, ServerStreamListener listener) {
+      try (final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
+          final VectorSchemaRoot root = createRoot(allocator)) {
+        writeStream(listener, root, provider, option);
+      }
+    }
+
+    @Override
+    public Runnable acceptPut(
+        CallContext context, FlightStream flightStream, StreamListener<PutResult> ackStream) {
+      return () -> {
+        try {
+          verifyStream(flightStream);
+          verifiedPutBatches = BATCHES;
+          ackStream.onCompleted();
+        } catch (Throwable t) {
+          ackStream.onError(
+              CallStatus.INVALID_ARGUMENT.withDescription(t.toString()).toRuntimeException());
+        }
+      };
+    }
+
+    @Override
+    public void doExchange(CallContext context, FlightStream reader, ServerStreamListener writer) {
+      // Read the first batch before starting, so that its dictionary has been received.
+      if (reader.next()) {
+        writer.start(reader.getRoot(), reader.getDictionaryProvider(), option);
+        do {
+          writer.putNext();
+        } while (reader.next());
+      }
+      writer.completed();
+    }
+  }
+
+  /** A name resolver that only resolves its target when {@link #resolve()} is called. */
+  static class ManualNameResolver extends NameResolver {
+    private final SocketAddress address;
+    private volatile Listener2 listener;
+
+    ManualNameResolver(SocketAddress address) {
+      this.address = address;
+    }
+
+    @Override
+    public String getServiceAuthority() {
+      return FlightTestUtil.LOCALHOST;
+    }
+
+    @Override
+    public void start(Listener2 listener) {
+      this.listener = listener;
+    }
+
+    @Override
+    public void shutdown() {}
+
+    void resolve() {
+      listener.onResult(
+          ResolutionResult.newBuilder()
+              .setAddresses(Collections.singletonList(new EquivalentAddressGroup(address)))
+              .build());
+    }
+
+    NameResolver.Factory factory() {
+      return new NameResolver.Factory() {
+        @Override
+        public NameResolver newNameResolver(URI targetUri, Args args) {
+          return ManualNameResolver.this;
+        }
+
+        @Override
+        public String getDefaultScheme() {
+          return "manual";
+        }
+      };
+    }
+  }
+
+  /** A raw gRPC Flight service that records the DoPut messages it receives. */
+  static class CapturingFlightService extends FlightServiceGrpc.FlightServiceImplBase {
+    private final List<Flight.FlightData> received;
+
+    CapturingFlightService(List<Flight.FlightData> received) {
+      this.received = received;
+    }
+
+    @Override
+    public StreamObserver<Flight.FlightData> doPut(
+        StreamObserver<Flight.PutResult> responseObserver) {
+      return new StreamObserver<Flight.FlightData>() {
+        @Override
+        public void onNext(Flight.FlightData value) {
+          received.add(value);
+        }
+
+        @Override
+        public void onError(Throwable t) {
+          responseObserver.onError(t);
+        }
+
+        @Override
+        public void onCompleted() {
+          responseObserver.onCompleted();
+        }
+      };
+    }
+  }
+}
