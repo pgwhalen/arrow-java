@@ -48,6 +48,7 @@ import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.util.Preconditions;
+import org.apache.arrow.vector.compression.NoCompressionCodec;
 import org.apache.arrow.vector.ipc.message.ArrowDictionaryBatch;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.ipc.message.IpcOption;
@@ -142,6 +143,9 @@ class ArrowMessage implements AutoCloseable {
   private final MessageMetadataResult message;
   private final ArrowBuf appMetadata;
   private final List<ArrowBuf> bufs;
+  // Whether the body buffers are compressed, i.e. owned by this message alone; see
+  // getCompressedBody().
+  private final boolean compressed;
   private final boolean tryZeroCopyWrite;
 
   public ArrowMessage(FlightDescriptor descriptor, Schema schema, IpcOption option) {
@@ -152,6 +156,7 @@ class ArrowMessage implements AutoCloseable {
     bufs = ImmutableList.of();
     this.descriptor = descriptor;
     this.appMetadata = null;
+    this.compressed = false;
     this.tryZeroCopyWrite = false;
   }
 
@@ -169,6 +174,7 @@ class ArrowMessage implements AutoCloseable {
     this.message =
         MessageMetadataResult.create(serializedMessage.slice(), serializedMessage.remaining());
     this.bufs = ImmutableList.copyOf(batch.getBuffers());
+    this.compressed = isCompressed(batch);
     this.descriptor = null;
     this.appMetadata = appMetadata;
     this.tryZeroCopyWrite = tryZeroCopy;
@@ -179,11 +185,12 @@ class ArrowMessage implements AutoCloseable {
     ByteBuffer serializedMessage = MessageSerializer.serializeMetadata(batch, writeOption);
     serializedMessage = serializedMessage.slice();
     this.message = MessageMetadataResult.create(serializedMessage, serializedMessage.remaining());
-    // asInputStream will free the buffers implicitly, so increment the reference count
+    // The batch is closed separately, and close() releases bufs, so take a reference of our own.
     batch.getDictionary().getBuffers().forEach(buf -> buf.getReferenceManager().retain());
     this.bufs = ImmutableList.copyOf(batch.getDictionary().getBuffers());
     this.descriptor = null;
     this.appMetadata = null;
+    this.compressed = isCompressed(batch.getDictionary());
     this.tryZeroCopyWrite = false;
   }
 
@@ -199,6 +206,7 @@ class ArrowMessage implements AutoCloseable {
     this.bufs = ImmutableList.of();
     this.descriptor = null;
     this.appMetadata = appMetadata;
+    this.compressed = false;
     this.tryZeroCopyWrite = false;
   }
 
@@ -209,6 +217,7 @@ class ArrowMessage implements AutoCloseable {
     this.bufs = ImmutableList.of();
     this.descriptor = descriptor;
     this.appMetadata = null;
+    this.compressed = false;
     this.tryZeroCopyWrite = false;
   }
 
@@ -228,7 +237,21 @@ class ArrowMessage implements AutoCloseable {
     this.descriptor = descriptor;
     this.appMetadata = appMetadata;
     this.bufs = buf == null ? ImmutableList.of() : ImmutableList.of(buf);
+    this.compressed = false;
     this.tryZeroCopyWrite = false;
+  }
+
+  private static boolean isCompressed(ArrowRecordBatch batch) {
+    return batch.getBodyCompression().getCodec() != NoCompressionCodec.COMPRESSION_TYPE;
+  }
+
+  /**
+   * The body buffers that only this message keeps alive: compressed buffers, which the codec
+   * allocated for this message. Empty for an uncompressed body, whose buffers belong to the
+   * writer's vectors.
+   */
+  List<ArrowBuf> getCompressedBody() {
+    return compressed ? bufs : ImmutableList.of();
   }
 
   public MessageMetadataResult asSchemaMessage() {
@@ -449,11 +472,12 @@ class ArrowMessage implements AutoCloseable {
    * stream after the writer has closed the message, e.g. on the in-process transport or while a
    * client call is not yet connected.
    *
-   * <p>gRPC may also call this more than once, when it retries a client call, and possibly after
-   * this message was closed. That works as long as the buffers are still alive, e.g. uncompressed
-   * buffers whose vectors have not been cleared. Buffers owned by this message alone, such as
-   * compressed bodies and app metadata, are freed by {@link #close()}; serializing then fails
-   * rather than reading freed memory.
+   * <p>gRPC may also call this after the writer closed the message, or more than once: a client
+   * call queues the message until it is connected, and replays it on a transparent retry. That
+   * works as long as the body buffers are alive. The writer's vectors keep uncompressed buffers
+   * alive; a Flight client keeps compressed buffers alive for as long (see {@link
+   * CompressedBodyHolder}). If they have been freed anyway, serializing fails rather than reading
+   * freed memory.
    *
    * @return InputStream
    */

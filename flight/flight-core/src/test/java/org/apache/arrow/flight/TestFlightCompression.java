@@ -18,6 +18,7 @@ package org.apache.arrow.flight;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.protobuf.ByteString;
@@ -27,10 +28,16 @@ import io.grpc.Server;
 import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
 import io.grpc.netty.NettyChannelBuilder;
+import io.grpc.stub.ClientCallStreamObserver;
+import io.grpc.stub.StreamObserver;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.CompositeByteBuf;
 import java.io.InputStream;
+import java.net.ServerSocket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -235,32 +242,215 @@ public class TestFlightCompression {
   }
 
   /**
-   * gRPC serializes a message again when it retries a client call, possibly after the writer closed
-   * it. That works while the buffers are alive, as uncompressed buffers are while their vectors
-   * are, but compressed buffers are owned by the message alone: serializing must then fail rather
-   * than read freed memory.
+   * Goal: compressed bodies live as long as uncompressed ones.
+   *
+   * <p>A client call may serialize a message object after the writer closed it: it queues messages
+   * until it is connected, and replays them on a transparent retry. Whether the body is compressed
+   * must not change what can still be serialized: the dictionary for the whole call, a record batch
+   * until the writer refills the root.
    */
   @ParameterizedTest
   @MethodSource("options")
-  public void testSerializeAfterClose(IpcOption option) throws Exception {
+  public void testClientBodyLifetime(IpcOption option) throws Exception {
+    final MethodDescriptor.Marshaller<ArrowMessage> marshaller =
+        ArrowMessage.createMarshaller(allocator);
+    final MessageQueueingObserver observer = new MessageQueueingObserver();
+    final CompressedBodyHolder compressedBodies = new CompressedBodyHolder();
+    try (final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
+        final VectorSchemaRoot root = createRoot(allocator)) {
+      final FlightClient.PutObserver writer =
+          new FlightClient.PutObserver(
+              FlightDescriptor.command(COMMAND),
+              observer,
+              compressedBodies,
+              /* isCancelled */ () -> false,
+              /* getResult */ () -> {});
+      // Not yet connected: the call queues messages.
+      assertTimeoutPreemptively(Duration.ofSeconds(30), () -> writer.start(root, provider, option));
+      observer.ready = true;
+      writer.putNext();
+      // The call connects and serializes the queued schema, dictionary and record batch, all
+      // closed by now.
+      final List<ArrowMessage> sent = observer.messages;
+      assertEquals(3, sent.size());
+      verifySerialized(marshaller, sent.get(1));
+      verifySerialized(marshaller, sent.get(2));
+
+      // The writer refills the root, freeing the first batch's uncompressed body, and sends again.
+      root.clear();
+      fillRoot(root);
+      writer.putNext();
+      // A retry can still replay the dictionary and the new batch, but not the first batch.
+      assertEquals(4, sent.size());
+      verifySerialized(marshaller, sent.get(1));
+      verifySerialized(marshaller, sent.get(3));
+      assertThrows(IllegalStateException.class, () -> marshaller.stream(sent.get(2)));
+
+      writer.completed();
+      compressedBodies.callEnded();
+    }
+    // tearDown fails the test if the call's end did not release the compressed bodies.
+  }
+
+  /**
+   * Goal: start() does not wait for the call. A client call that never becomes ready, with a
+   * listener that never reports it cancelled, must not block start() (as startPut() calls it).
+   */
+  @ParameterizedTest
+  @MethodSource("options")
+  public void testStartDoesNotWait(IpcOption option) throws Exception {
+    final MessageQueueingObserver observer = new MessageQueueingObserver();
+    final CompressedBodyHolder compressedBodies = new CompressedBodyHolder();
+    try (final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
+        final VectorSchemaRoot root = createRoot(allocator)) {
+      final FlightClient.PutObserver writer =
+          new FlightClient.PutObserver(
+              FlightDescriptor.command(COMMAND),
+              observer,
+              compressedBodies,
+              /* isCancelled */ () -> false,
+              /* getResult */ () -> {});
+      assertTimeoutPreemptively(Duration.ofSeconds(30), () -> writer.start(root, provider, option));
+      // The schema and dictionary are queued for when the call connects.
+      assertEquals(2, observer.messages.size());
+      compressedBodies.callEnded();
+    }
+  }
+
+  /**
+   * Goal: start() does not wait for the call, end to end. The call fails before it ever connects;
+   * startPut() returns, the failure is reported by getResult(), and the compressed dictionary held
+   * for the queued message is released (checked by tearDown).
+   */
+  @ParameterizedTest
+  @MethodSource("options")
+  public void testStartPutBeforeConnectFails(IpcOption option) throws Exception {
+    final int unusedPort;
+    try (final ServerSocket socket = new ServerSocket(0)) {
+      unusedPort = socket.getLocalPort();
+    }
+    try (final FlightClient unconnected = newClient(unusedPort);
+        final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
+        final VectorSchemaRoot root = createRoot(allocator)) {
+      final FlightClient.ClientStreamListener writer =
+          assertTimeoutPreemptively(
+              Duration.ofSeconds(30),
+              () -> {
+                final FlightClient.ClientStreamListener listener =
+                    unconnected.startPut(
+                        FlightDescriptor.command(COMMAND),
+                        new AsyncPutListener() {
+                          @Override
+                          public boolean isCancelled() {
+                            return false;
+                          }
+                        });
+                listener.start(root, provider, option);
+                return listener;
+              });
+      writer.completed();
+      final FlightRuntimeException e =
+          assertThrows(FlightRuntimeException.class, writer::getResult);
+      assertEquals(FlightStatusCode.UNAVAILABLE, e.status().code());
+    }
+  }
+
+  /**
+   * Goal: no additional copy. Serializing a message wraps its body buffers, compressed or not, in
+   * the stream handed to gRPC instead of copying them, with or without zero-copy writes (without,
+   * gRPC copies the stream into its own buffers as it always has).
+   */
+  @ParameterizedTest
+  @MethodSource("optionsAndZeroCopy")
+  public void testSerializeDoesNotCopyBody(IpcOption option, boolean zeroCopy) throws Exception {
     final MethodDescriptor.Marshaller<ArrowMessage> marshaller =
         ArrowMessage.createMarshaller(allocator);
     try (final VectorSchemaRoot root = createRoot(allocator)) {
-      final ArrowMessage message =
-          new ArrowMessage(recordBatch(root, option), /* appMetadata */ null, false, option);
-      message.close();
-      if (option.codecType != CodecType.NO_COMPRESSION) {
-        assertThrows(IllegalStateException.class, () -> marshaller.stream(message));
-        return;
-      }
-      // Serialize twice, as a retry would.
-      for (int attempt = 0; attempt < 2; attempt++) {
-        try (final InputStream stream = marshaller.stream(message);
-            final ArrowMessage parsed = marshaller.parse(stream)) {
-          verifyBatch(parsed);
+      // The body: the compressed buffers, or the vectors' own buffers.
+      final ArrowRecordBatch batch = recordBatch(root, option);
+      final List<ArrowBuf> body = batch.getBuffers();
+      try (final ArrowMessage message =
+          new ArrowMessage(batch, /* appMetadata */ null, zeroCopy, option)) {
+        final long allocated = allocator.getAllocatedMemory();
+        try (final InputStream stream = marshaller.stream(message)) {
+          assertEquals(allocated, allocator.getAllocatedMemory());
+          final List<Long> streamed = componentAddresses(stream);
+          for (ArrowBuf buf : body) {
+            if (buf.readableBytes() > 0) {
+              assertTrue(streamed.contains(buf.memoryAddress()), "Body buffer was copied");
+            }
+          }
         }
       }
     }
+  }
+
+  /** Serialize a message, as gRPC would, and check it can be read back. */
+  private void verifySerialized(
+      MethodDescriptor.Marshaller<ArrowMessage> marshaller, ArrowMessage message) throws Exception {
+    try (final InputStream stream = marshaller.stream(message);
+        final ArrowMessage parsed = marshaller.parse(stream)) {
+      assertEquals(message.getMessageType(), parsed.getMessageType());
+      if (parsed.getMessageType() == ArrowMessage.HeaderType.RECORD_BATCH) {
+        verifyBatch(parsed);
+      }
+    }
+  }
+
+  /** The memory addresses of the buffers making up a serialized message. */
+  private static List<Long> componentAddresses(InputStream stream) throws Exception {
+    final java.lang.reflect.Field field = stream.getClass().getDeclaredField("buf");
+    field.setAccessible(true);
+    final CompositeByteBuf buf = (CompositeByteBuf) field.get(stream);
+    final List<Long> addresses = new ArrayList<>();
+    for (int i = 0; i < buf.numComponents(); i++) {
+      final ByteBuf component = buf.internalComponent(i);
+      if (component.hasMemoryAddress()) {
+        addresses.add(component.memoryAddress() + component.readerIndex());
+      }
+    }
+    return addresses;
+  }
+
+  /**
+   * A client call's write side that queues the messages handed to it, as gRPC does before a call is
+   * connected and until it is committed (for retries), and that is ready only once told so.
+   */
+  private static final class MessageQueueingObserver
+      extends ClientCallStreamObserver<ArrowMessage> {
+    final List<ArrowMessage> messages = new ArrayList<>();
+    volatile boolean ready = false;
+
+    @Override
+    public void onNext(ArrowMessage value) {
+      messages.add(value);
+    }
+
+    @Override
+    public boolean isReady() {
+      return ready;
+    }
+
+    @Override
+    public void onError(Throwable t) {}
+
+    @Override
+    public void onCompleted() {}
+
+    @Override
+    public void cancel(String message, Throwable cause) {}
+
+    @Override
+    public void setOnReadyHandler(Runnable onReadyHandler) {}
+
+    @Override
+    public void disableAutoInboundFlowControl() {}
+
+    @Override
+    public void request(int count) {}
+
+    @Override
+    public void setMessageCompression(boolean enable) {}
   }
 
   private static ArrowRecordBatch recordBatch(VectorSchemaRoot root, IpcOption option) {
@@ -303,6 +493,52 @@ public class TestFlightCompression {
     verifyWireFormat(option, messages);
   }
 
+  /** Goal: clients compress too. A client writing DoPut compresses both kinds of batch. */
+  @ParameterizedTest
+  @MethodSource("options")
+  public void testClientWireFormat(IpcOption option) throws Exception {
+    final List<Flight.FlightData> messages = Collections.synchronizedList(new ArrayList<>());
+    final String name = InProcessServerBuilder.generateName();
+    final Server rawServer =
+        InProcessServerBuilder.forName(name)
+            .addService(
+                new FlightServiceGrpc.FlightServiceImplBase() {
+                  @Override
+                  public StreamObserver<Flight.FlightData> doPut(
+                      StreamObserver<Flight.PutResult> responseObserver) {
+                    return new StreamObserver<Flight.FlightData>() {
+                      @Override
+                      public void onNext(Flight.FlightData value) {
+                        messages.add(value);
+                      }
+
+                      @Override
+                      public void onError(Throwable t) {}
+
+                      @Override
+                      public void onCompleted() {
+                        responseObserver.onCompleted();
+                      }
+                    };
+                  }
+                })
+            .build()
+            .start();
+    try (final FlightClient rawClient =
+            FlightGrpcUtils.createFlightClient(
+                allocator, InProcessChannelBuilder.forName(name).build());
+        final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
+        final VectorSchemaRoot root = createRoot(allocator)) {
+      final FlightClient.ClientStreamListener listener =
+          rawClient.startPut(FlightDescriptor.command(COMMAND), new AsyncPutListener());
+      writeStream(listener, root, provider, option);
+      listener.getResult();
+    } finally {
+      rawServer.shutdownNow().awaitTermination(30, TimeUnit.SECONDS);
+    }
+    verifyWireFormat(option, messages);
+  }
+
   /** DoPut the root with the given option, which the producer verifies. */
   private void putStream(FlightClient client, IpcOption option, boolean zeroCopy) throws Exception {
     producer.verifiedPutBatches = 0;
@@ -340,6 +576,11 @@ public class TestFlightCompression {
   /** Create a root holding a highly compressible batch. */
   private static VectorSchemaRoot createRoot(BufferAllocator allocator) {
     final VectorSchemaRoot root = VectorSchemaRoot.create(SCHEMA, allocator);
+    fillRoot(root);
+    return root;
+  }
+
+  private static void fillRoot(VectorSchemaRoot root) {
     final IntVector ints = (IntVector) root.getVector("i");
     final IntVector indices = (IntVector) root.getVector("encoded");
     ints.allocateNew(ROWS);
@@ -351,7 +592,6 @@ public class TestFlightCompression {
       }
     }
     root.setRowCount(ROWS);
-    return root;
   }
 
   /** Send the root {@link #BATCHES} times, then complete the stream. */

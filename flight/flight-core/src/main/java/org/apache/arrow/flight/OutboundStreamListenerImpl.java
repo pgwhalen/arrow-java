@@ -61,12 +61,9 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
             CompressionUtil.defaultFactory(option.codecType),
             option.codecType,
             option.compressionLevel);
-    // Until a client call is connected, gRPC queues messages unserialized, and would serialize them
-    // after they are closed below, when (compressed) dictionary buffers are already freed.
-    waitUntilStreamReady();
     try {
       DictionaryUtils.generateSchemaMessages(
-          root.getSchema(), descriptor, dictionaries, option, codec, responseObserver::onNext);
+          root.getSchema(), descriptor, dictionaries, option, codec, this::send);
     } catch (RuntimeException e) {
       // Propagate runtime exceptions, like those raised when trying to write unions with V4
       // metadata
@@ -103,15 +100,12 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
     }
 
     waitUntilStreamReady();
-    // close is a no-op if the message has been written to gRPC, otherwise frees the associated
-    // buffers
-    // in some code paths (e.g. if the call is cancelled), gRPC does not write the message, so we
-    // need to clean up
-    // ourselves. Normally, writing the ArrowMessage will transfer ownership of the data to
-    // gRPC/Netty.
+    // The message's own references are not needed once it is sent: the serialized stream takes
+    // its own, and a client keeps compressed bodies alive in case gRPC serializes the message
+    // later (see sent()). If sending fails, closing frees the batch.
     try (final ArrowMessage message =
         new ArrowMessage(unloader.getRecordBatch(), metadata, tryZeroCopy, option)) {
-      responseObserver.onNext(message);
+      send(message);
     } catch (Exception e) {
       // This exception comes from ArrowMessage#close, not responseObserver#onNext.
       // Generally this should not happen - ArrowMessage's implementation only closes non-throwing
@@ -122,6 +116,19 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
       throw new RuntimeException("Could not free ArrowMessage", e);
     }
   }
+
+  private void send(ArrowMessage message) {
+    responseObserver.onNext(message);
+    sent(message);
+  }
+
+  /**
+   * Called after a message is handed to gRPC, before it is closed.
+   *
+   * <p>Overridden by clients, where gRPC may serialize the message later (see {@link
+   * CompressedBodyHolder}).
+   */
+  protected void sent(ArrowMessage message) {}
 
   @Override
   public void putMetadata(ArrowBuf metadata) {
