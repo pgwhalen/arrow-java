@@ -61,6 +61,9 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
             CompressionUtil.defaultFactory(option.codecType),
             option.codecType,
             option.compressionLevel);
+    // Until a client call is connected, gRPC queues messages unserialized, and would serialize them
+    // after they are closed below, when (compressed) dictionary buffers are already freed.
+    waitUntilStreamReady();
     try {
       DictionaryUtils.generateSchemaMessages(
           root.getSchema(), descriptor, dictionaries, option, codec, responseObserver::onNext);

@@ -16,8 +16,6 @@
  */
 package org.apache.arrow.flight;
 
-import static org.apache.arrow.memory.util.LargeMemoryUtil.checkedCastToInt;
-
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.google.protobuf.ByteString;
@@ -50,7 +48,6 @@ import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.util.Preconditions;
-import org.apache.arrow.vector.compression.NoCompressionCodec;
 import org.apache.arrow.vector.ipc.message.ArrowDictionaryBatch;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.ipc.message.IpcOption;
@@ -145,8 +142,6 @@ class ArrowMessage implements AutoCloseable {
   private final MessageMetadataResult message;
   private final ArrowBuf appMetadata;
   private final List<ArrowBuf> bufs;
-  // The body buffers to write; see body().
-  private final List<ByteBuffer> body;
   private final boolean tryZeroCopyWrite;
 
   public ArrowMessage(FlightDescriptor descriptor, Schema schema, IpcOption option) {
@@ -155,7 +150,6 @@ class ArrowMessage implements AutoCloseable {
     this.message =
         MessageMetadataResult.create(serializedMessage.slice(), serializedMessage.remaining());
     bufs = ImmutableList.of();
-    this.body = ImmutableList.of();
     this.descriptor = descriptor;
     this.appMetadata = null;
     this.tryZeroCopyWrite = false;
@@ -175,7 +169,6 @@ class ArrowMessage implements AutoCloseable {
     this.message =
         MessageMetadataResult.create(serializedMessage.slice(), serializedMessage.remaining());
     this.bufs = ImmutableList.copyOf(batch.getBuffers());
-    this.body = body(bufs, batch);
     this.descriptor = null;
     this.appMetadata = appMetadata;
     this.tryZeroCopyWrite = tryZeroCopy;
@@ -189,7 +182,6 @@ class ArrowMessage implements AutoCloseable {
     // asInputStream will free the buffers implicitly, so increment the reference count
     batch.getDictionary().getBuffers().forEach(buf -> buf.getReferenceManager().retain());
     this.bufs = ImmutableList.copyOf(batch.getDictionary().getBuffers());
-    this.body = body(bufs, batch.getDictionary());
     this.descriptor = null;
     this.appMetadata = null;
     this.tryZeroCopyWrite = false;
@@ -205,7 +197,6 @@ class ArrowMessage implements AutoCloseable {
     this.writeOption = IpcOption.DEFAULT;
     this.message = null;
     this.bufs = ImmutableList.of();
-    this.body = ImmutableList.of();
     this.descriptor = null;
     this.appMetadata = appMetadata;
     this.tryZeroCopyWrite = false;
@@ -216,7 +207,6 @@ class ArrowMessage implements AutoCloseable {
     this.writeOption = IpcOption.DEFAULT;
     this.message = null;
     this.bufs = ImmutableList.of();
-    this.body = ImmutableList.of();
     this.descriptor = descriptor;
     this.appMetadata = null;
     this.tryZeroCopyWrite = false;
@@ -238,33 +228,7 @@ class ArrowMessage implements AutoCloseable {
     this.descriptor = descriptor;
     this.appMetadata = appMetadata;
     this.bufs = buf == null ? ImmutableList.of() : ImmutableList.of(buf);
-    this.body = buf == null ? ImmutableList.of() : ImmutableList.of(buf.nioBuffer());
     this.tryZeroCopyWrite = false;
-  }
-
-  /**
-   * The body buffers to write for a batch: views of its buffers, or heap copies if it is
-   * compressed.
-   *
-   * <p>gRPC may serialize a message after the writer has closed it: on the in-process transport,
-   * before a client call is connected, or when a call is retried. That is safe for uncompressed
-   * buffers, which the writer's vectors keep alive, but compressed buffers are owned by the message
-   * alone. Copying them to the heap gives them the same lifetime, managed by the garbage collector.
-   */
-  private static List<ByteBuffer> body(List<ArrowBuf> buffers, ArrowRecordBatch batch) {
-    final boolean compressed =
-        batch.getBodyCompression().getCodec() != NoCompressionCodec.COMPRESSION_TYPE;
-    final ImmutableList.Builder<ByteBuffer> body = ImmutableList.builder();
-    for (ArrowBuf buf : buffers) {
-      if (compressed) {
-        final ByteBuffer copy = ByteBuffer.allocate(checkedCastToInt(buf.readableBytes()));
-        copy.put(buf.nioBuffer()).flip();
-        body.add(copy);
-      } else {
-        body.add(buf.nioBuffer());
-      }
-    }
-    return body.build();
   }
 
   public MessageMetadataResult asSchemaMessage() {
@@ -480,11 +444,22 @@ class ArrowMessage implements AutoCloseable {
   /**
    * Convert the ArrowMessage to an InputStream.
    *
-   * <p>Implicitly, this transfers ownership of the contained buffers to the InputStream.
+   * <p>The stream holds its own references to the body buffers, released when gRPC releases the
+   * stream, so it stays valid after this message is closed. gRPC relies on that: it may read a
+   * stream after the writer has closed the message, e.g. on the in-process transport or while a
+   * client call is not yet connected.
+   *
+   * <p>gRPC may also call this more than once, when it retries a client call, and possibly after
+   * this message was closed. That works as long as the buffers are still alive, e.g. uncompressed
+   * buffers whose vectors have not been cleared. Buffers owned by this message alone, such as
+   * compressed bodies and app metadata, are freed by {@link #close()}; serializing then fails
+   * rather than reading freed memory.
    *
    * @return InputStream
    */
   private InputStream asInputStream() {
+    checkAlive(appMetadata);
+    bufs.forEach(ArrowMessage::checkAlive);
     if (message == null) {
       // If we have no IPC message, it's a pure-metadata message
       final FlightData.Builder builder = FlightData.newBuilder();
@@ -534,16 +509,16 @@ class ArrowMessage implements AutoCloseable {
       cos.writeTag(FlightData.DATA_BODY_FIELD_NUMBER, WireFormat.WIRETYPE_LENGTH_DELIMITED);
       int size = 0;
       List<ByteBuf> allBufs = new ArrayList<>();
-      for (ByteBuffer b : body) {
+      for (ArrowBuf b : bufs) {
         // [ARROW-11066] This creates a Netty buffer whose refcnt is INDEPENDENT of the backing
         // Arrow buffer. This is susceptible to use-after-free, so we subclass CompositeByteBuf
         // below to tie the Arrow buffer refcnt to the Netty buffer refcnt
-        allBufs.add(Unpooled.wrappedBuffer(b).retain());
-        size += b.remaining();
+        allBufs.add(Unpooled.wrappedBuffer(b.nioBuffer()).retain());
+        size += (int) b.readableBytes();
         // [ARROW-4213] These buffers must be aligned to an 8-byte boundary in order to be readable
         // from C++.
-        if (b.remaining() % 8 != 0) {
-          int paddingBytes = 8 - (b.remaining() % 8);
+        if (b.readableBytes() % 8 != 0) {
+          int paddingBytes = (int) (8 - (b.readableBytes() % 8));
           assert paddingBytes > 0 && paddingBytes < 8;
           size += paddingBytes;
           allBufs.add(PADDING_BUFFERS.get(paddingBytes).retain());
@@ -555,7 +530,6 @@ class ArrowMessage implements AutoCloseable {
 
       ByteBuf initialBuf = Unpooled.buffer(baos.size());
       initialBuf.writeBytes(baos.toByteArray());
-      final CompositeByteBuf bb;
       final ImmutableList<ByteBuf> byteBufs =
           ImmutableList.<ByteBuf>builder().add(initialBuf).addAll(allBufs).build();
       // See: https://github.com/apache/arrow/issues/40039
@@ -579,17 +553,22 @@ class ArrowMessage implements AutoCloseable {
       // large CompositeByteBuf we're creating here.
       // We never want additional memory copies so setting the limit to Integer.MAX_VALUE
       final int maxNumComponents = Integer.MAX_VALUE;
-      if (tryZeroCopyWrite) {
-        bb = new ArrowBufRetainingCompositeByteBuf(maxNumComponents, byteBufs, bufs);
-      } else {
-        // Don't retain the buffers in the non-zero-copy path since we're copying them
-        bb =
-            new CompositeByteBuf(
-                UnpooledByteBufAllocator.DEFAULT, /* direct */ true, maxNumComponents, byteBufs);
-      }
+      // Retain the body buffers even when they will be copied: gRPC may not read the stream until
+      // after this message is closed.
+      final CompositeByteBuf bb =
+          new ArrowBufRetainingCompositeByteBuf(maxNumComponents, byteBufs, bufs);
       return new DrainableByteBufInputStream(bb, tryZeroCopyWrite);
     } catch (Exception ex) {
       throw new RuntimeException("Unexpected IO Exception", ex);
+    }
+  }
+
+  /** Fail if a buffer to be serialized has been freed, rather than reading freed memory. */
+  private static void checkAlive(ArrowBuf buf) {
+    if (buf != null && buf.getReferenceManager().getRefCount() == 0) {
+      throw new IllegalStateException(
+          "Cannot serialize a Flight message whose buffers have been freed. This can happen if "
+              + "gRPC retries a call after the message was written.");
     }
   }
 
@@ -607,6 +586,10 @@ class ArrowMessage implements AutoCloseable {
    *
    * <p>This class solves that issue by bridging Arrow and Netty/gRPC. We increment the refcnt on a
    * set of Arrow backing buffers and decrement them once the Netty buffers are freed by gRPC.
+   *
+   * <p>The same holds without zero-copy: gRPC copies the buffers when it reads the stream, which
+   * can be after the message was closed (see {@link #asInputStream()}), so it is used for every
+   * message with a body.
    */
   private static final class ArrowBufRetainingCompositeByteBuf extends CompositeByteBuf {
     // Arrow buffers that back the Netty ByteBufs here; ByteBufs held by this class are

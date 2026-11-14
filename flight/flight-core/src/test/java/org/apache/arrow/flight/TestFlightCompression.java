@@ -17,6 +17,7 @@
 package org.apache.arrow.flight;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.protobuf.ByteString;
@@ -71,6 +72,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 /** Tests that Flight writers compress IPC bodies as requested by {@link IpcOption}. */
@@ -145,7 +147,14 @@ public class TestFlightCompression {
   @ParameterizedTest
   @MethodSource("options")
   public void testDoPut(IpcOption option) throws Exception {
-    putStream(client, option);
+    putStream(client, option, /* zeroCopy */ false);
+  }
+
+  /** As {@link #testDoPut}, with the zero-copy write path. */
+  @ParameterizedTest
+  @MethodSource("options")
+  public void testDoPutZeroCopy(IpcOption option) throws Exception {
+    putStream(client, option, /* zeroCopy */ true);
   }
 
   @ParameterizedTest
@@ -185,47 +194,91 @@ public class TestFlightCompression {
       try (final FlightStream stream = inProcessClient.getStream(new Ticket(COMMAND))) {
         verifyStream(stream);
       }
-      putStream(inProcessClient, option);
+      putStream(inProcessClient, option, /* zeroCopy */ false);
     } finally {
       inProcessServer.shutdownNow().awaitTermination(30, TimeUnit.SECONDS);
       executor.shutdownNow();
     }
   }
 
+  static Stream<Arguments> optionsAndZeroCopy() {
+    return options()
+        .flatMap(option -> Stream.of(Arguments.of(option, false), Arguments.of(option, true)));
+  }
+
   /**
-   * gRPC may serialize a message after the writer has closed it: on the in-process transport,
-   * before a client call is connected, or again when a call is retried. Compressed messages must
-   * stay serializable then, like uncompressed ones whose vectors are still alive.
+   * gRPC may read a serialized message after the writer has closed it and moved on, e.g. on the
+   * in-process transport or before a client call is connected. The stream must keep the body and
+   * app metadata alive, whether or not it is written zero-copy.
+   */
+  @ParameterizedTest
+  @MethodSource("optionsAndZeroCopy")
+  public void testStreamOutlivesMessage(IpcOption option, boolean zeroCopy) throws Exception {
+    final MethodDescriptor.Marshaller<ArrowMessage> marshaller =
+        ArrowMessage.createMarshaller(allocator);
+    final InputStream stream;
+    try (final VectorSchemaRoot root = createRoot(allocator)) {
+      final ArrowBuf appMetadata = allocator.buffer(Long.BYTES);
+      appMetadata.writeLong(42);
+      try (final ArrowMessage message =
+          new ArrowMessage(recordBatch(root, option), appMetadata, zeroCopy, option)) {
+        stream = marshaller.stream(message);
+      }
+      // As a writer would before refilling it.
+      root.clear();
+    }
+    try (final InputStream s = stream;
+        final ArrowMessage parsed = marshaller.parse(s)) {
+      assertEquals(42, parsed.getApplicationMetadata().getLong(0));
+      verifyBatch(parsed);
+    }
+  }
+
+  /**
+   * gRPC serializes a message again when it retries a client call, possibly after the writer closed
+   * it. That works while the buffers are alive, as uncompressed buffers are while their vectors
+   * are, but compressed buffers are owned by the message alone: serializing must then fail rather
+   * than read freed memory.
    */
   @ParameterizedTest
   @MethodSource("options")
   public void testSerializeAfterClose(IpcOption option) throws Exception {
     final MethodDescriptor.Marshaller<ArrowMessage> marshaller =
         ArrowMessage.createMarshaller(allocator);
-    try (final VectorSchemaRoot root = createRoot(allocator);
-        final VectorSchemaRoot received = VectorSchemaRoot.create(SCHEMA, allocator)) {
-      final CompressionCodec codec =
-          CompressionUtil.createCodec(
-              CompressionCodec.Factory.INSTANCE, option.codecType, option.compressionLevel);
+    try (final VectorSchemaRoot root = createRoot(allocator)) {
       final ArrowMessage message =
-          new ArrowMessage(
-              new VectorUnloader(root, /* includeNullCount */ true, codec, /* alignBuffers */ true)
-                  .getRecordBatch(),
-              /* appMetadata */ null,
-              /* tryZeroCopy */ false,
-              option);
+          new ArrowMessage(recordBatch(root, option), /* appMetadata */ null, false, option);
       message.close();
+      if (option.codecType != CodecType.NO_COMPRESSION) {
+        assertThrows(IllegalStateException.class, () -> marshaller.stream(message));
+        return;
+      }
       // Serialize twice, as a retry would.
       for (int attempt = 0; attempt < 2; attempt++) {
         try (final InputStream stream = marshaller.stream(message);
-            final ArrowMessage parsed = marshaller.parse(stream);
-            final ArrowRecordBatch batch = parsed.asRecordBatch()) {
-          new VectorLoader(received).load(batch);
-          final IntVector ints = (IntVector) received.getVector("i");
-          for (int row = 0; row < ROWS; row++) {
-            assertEquals(row % 16, ints.get(row));
-          }
+            final ArrowMessage parsed = marshaller.parse(stream)) {
+          verifyBatch(parsed);
         }
+      }
+    }
+  }
+
+  private static ArrowRecordBatch recordBatch(VectorSchemaRoot root, IpcOption option) {
+    final CompressionCodec codec =
+        CompressionUtil.createCodec(
+            CompressionCodec.Factory.INSTANCE, option.codecType, option.compressionLevel);
+    return new VectorUnloader(root, /* includeNullCount */ true, codec, /* alignBuffers */ true)
+        .getRecordBatch();
+  }
+
+  /** Verify a parsed record batch written from {@link #createRoot}. */
+  private void verifyBatch(ArrowMessage parsed) throws Exception {
+    try (final VectorSchemaRoot received = VectorSchemaRoot.create(SCHEMA, allocator);
+        final ArrowRecordBatch batch = parsed.asRecordBatch()) {
+      new VectorLoader(received).load(batch);
+      final IntVector ints = (IntVector) received.getVector("i");
+      for (int row = 0; row < ROWS; row++) {
+        assertEquals(row % 16, ints.get(row));
       }
     }
   }
@@ -251,12 +304,13 @@ public class TestFlightCompression {
   }
 
   /** DoPut the root with the given option, which the producer verifies. */
-  private void putStream(FlightClient client, IpcOption option) throws Exception {
+  private void putStream(FlightClient client, IpcOption option, boolean zeroCopy) throws Exception {
     producer.verifiedPutBatches = 0;
     try (final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
         final VectorSchemaRoot root = createRoot(allocator)) {
       final FlightClient.ClientStreamListener listener =
           client.startPut(FlightDescriptor.command(COMMAND), new AsyncPutListener());
+      listener.setUseZeroCopy(zeroCopy);
       writeStream(listener, root, provider, option);
       listener.getResult();
     }
