@@ -29,7 +29,6 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.compression.CompressionCodec;
 import org.apache.arrow.vector.compression.CompressionUtil;
-import org.apache.arrow.vector.compression.NoCompressionCodec;
 import org.apache.arrow.vector.dictionary.Dictionary;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.ipc.message.ArrowBlock;
@@ -95,9 +94,7 @@ public abstract class ArrowWriter implements AutoCloseable {
         provider,
         out,
         option,
-        option.codecType == CompressionUtil.CodecType.NO_COMPRESSION
-            ? NoCompressionCodec.Factory.INSTANCE
-            : CompressionCodec.Factory.INSTANCE,
+        CompressionUtil.defaultFactory(option.codecType),
         option.codecType,
         option.compressionLevel);
   }
@@ -105,9 +102,10 @@ public abstract class ArrowWriter implements AutoCloseable {
   /**
    * Note: fields are not closed when the writer is closed.
    *
-   * <p>If {@code option} requests body compression, {@code codecType} and {@code compressionLevel}
-   * must match the option's codec and level, and {@code compressionFactory} is used to create that
-   * codec. If {@code option} does not request compression, the explicit arguments are used as
+   * <p>If {@code option} requests body compression, {@code codecType} must match the option's
+   * codec, and {@code compressionFactory} is used to create it. The compression level is {@code
+   * compressionLevel} if present, and the option's level otherwise; if both are present, they must
+   * be equal. If {@code option} does not request compression, the explicit arguments are used as
    * given.
    *
    * @param root the vectors to write to the output
@@ -117,8 +115,8 @@ public abstract class ArrowWriter implements AutoCloseable {
    * @param compressionFactory Compression codec factory
    * @param codecType Compression codec
    * @param compressionLevel Compression level
-   * @throws IllegalArgumentException if {@code option} requests compression that differs from
-   *     {@code codecType} or {@code compressionLevel}
+   * @throws IllegalArgumentException if {@code option} requests compression with a codec other than
+   *     {@code codecType}, or with a level other than a present {@code compressionLevel}
    */
   protected ArrowWriter(
       VectorSchemaRoot root,
@@ -128,14 +126,13 @@ public abstract class ArrowWriter implements AutoCloseable {
       CompressionCodec.Factory compressionFactory,
       CompressionUtil.CodecType codecType,
       Optional<Integer> compressionLevel) {
-    checkCompressionAgreesWithOption(option, codecType, compressionLevel);
     this.out = new WriteChannel(out);
     this.option = option;
     this.dictionaryProvider = provider;
 
     this.compressionFactory = compressionFactory;
     this.codecType = codecType;
-    this.compressionLevel = compressionLevel;
+    this.compressionLevel = resolveCompressionLevel(option, codecType, compressionLevel);
     this.codec =
         CompressionUtil.createCodec(this.compressionFactory, this.codecType, this.compressionLevel);
     this.unloader =
@@ -153,13 +150,21 @@ public abstract class ArrowWriter implements AutoCloseable {
     this.schema = new Schema(fields, root.getSchema().getCustomMetadata());
   }
 
-  private static void checkCompressionAgreesWithOption(
+  /**
+   * The compression level to use: the explicit level if present, else the option's level. Throws if
+   * the option requests compression that conflicts with the explicit codec or level.
+   */
+  private static Optional<Integer> resolveCompressionLevel(
       IpcOption option, CompressionUtil.CodecType codecType, Optional<Integer> compressionLevel) {
     if (option.codecType == CompressionUtil.CodecType.NO_COMPRESSION) {
       // The option does not request compression: the explicit arguments apply as given.
-      return;
+      return compressionLevel;
     }
-    if (option.codecType != codecType || !option.compressionLevel.equals(compressionLevel)) {
+    final boolean levelsConflict =
+        compressionLevel.isPresent()
+            && option.compressionLevel.isPresent()
+            && !compressionLevel.equals(option.compressionLevel);
+    if (option.codecType != codecType || levelsConflict) {
       throw new IllegalArgumentException(
           "IpcOption requests compression with codec "
               + option.codecType
@@ -170,6 +175,7 @@ public abstract class ArrowWriter implements AutoCloseable {
               + " and level "
               + compressionLevel);
     }
+    return compressionLevel.isPresent() ? compressionLevel : option.compressionLevel;
   }
 
   public void start() throws IOException {

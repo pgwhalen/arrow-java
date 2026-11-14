@@ -27,6 +27,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.channels.Channels;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
@@ -273,21 +274,64 @@ public class TestArrowWriterCompressionOption extends BaseFileTest {
       assertThrows(
           IllegalArgumentException.class,
           () ->
-              new ArrowStreamWriter(
-                  root, null, Channels.newChannel(out), zstd3, IDENTITY_FACTORY, CodecType.ZSTD));
-      assertThrows(
-          IllegalArgumentException.class,
-          () ->
               new ArrowFileWriter(
                   root,
                   null,
                   Channels.newChannel(out),
                   null,
-                  zstd,
+                  zstd3,
                   IDENTITY_FACTORY,
                   CodecType.ZSTD,
-                  Optional.of(3)));
+                  Optional.of(4)));
     }
+  }
+
+  /** A level given only by the option or only by the explicit arguments applies. */
+  @Test
+  public void testLevelFromEitherSideApplies() throws IOException {
+    IpcOption zstd = IpcOption.DEFAULT.withCompression(CodecType.ZSTD);
+    IpcOption zstd3 = IpcOption.DEFAULT.withCompression(CodecType.ZSTD, 3);
+    List<Integer> levels = new ArrayList<>();
+    CompressionCodec.Factory recordingFactory =
+        new CompressionCodec.Factory() {
+          @Override
+          public CompressionCodec createCodec(CodecType codecType) {
+            levels.add(null);
+            return IDENTITY_FACTORY.createCodec(codecType);
+          }
+
+          @Override
+          public CompressionCodec createCodec(CodecType codecType, int compressionLevel) {
+            levels.add(compressionLevel);
+            return IDENTITY_FACTORY.createCodec(codecType, compressionLevel);
+          }
+        };
+    try (VectorSchemaRoot root = createRoot()) {
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      new ArrowStreamWriter(
+              root, null, Channels.newChannel(out), zstd3, recordingFactory, CodecType.ZSTD)
+          .close();
+      new ArrowFileWriter(
+              root,
+              null,
+              Channels.newChannel(out),
+              null,
+              zstd,
+              recordingFactory,
+              CodecType.ZSTD,
+              Optional.of(5))
+          .close();
+      new ArrowStreamWriter(
+              root,
+              null,
+              Channels.newChannel(out),
+              zstd,
+              recordingFactory,
+              CodecType.ZSTD,
+              Optional.empty())
+          .close();
+    }
+    assertEquals(Arrays.asList(3, 5, null), levels);
   }
 
   @Test

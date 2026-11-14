@@ -58,7 +58,9 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
     this.option = option;
     final CompressionCodec codec =
         CompressionUtil.createCodec(
-            CompressionCodec.Factory.INSTANCE, option.codecType, option.compressionLevel);
+            CompressionUtil.defaultFactory(option.codecType),
+            option.codecType,
+            option.compressionLevel);
     try {
       DictionaryUtils.generateSchemaMessages(
           root.getSchema(), descriptor, dictionaries, option, codec, responseObserver::onNext);

@@ -93,6 +93,18 @@ public class CompressionUtil {
   }
 
   /**
+   * The factory to create a codec of the given type with by default: {@link
+   * NoCompressionCodec.Factory#INSTANCE} for {@link CodecType#NO_COMPRESSION}, so that writing
+   * without compression never depends on the codecs on the classpath, and {@link
+   * CompressionCodec.Factory#INSTANCE} otherwise.
+   */
+  public static CompressionCodec.Factory defaultFactory(CodecType codecType) {
+    return codecType == CodecType.NO_COMPRESSION
+        ? NoCompressionCodec.Factory.INSTANCE
+        : CompressionCodec.Factory.INSTANCE;
+  }
+
+  /**
    * Creates a codec from the given factory, using the compression level if present and the codec's
    * default level otherwise.
    *
