@@ -44,7 +44,7 @@ public class CommonsCompressionFactory implements CompressionCodec.Factory {
   public CompressionCodec createCodec(CompressionUtil.CodecType codecType, int compressionLevel) {
     switch (codecType) {
       case LZ4_FRAME:
-        return new Lz4CompressionCodec(compressionLevel);
+        return new Lz4CompressionCodec();
       case ZSTD:
         return new ZstdCompressionCodec(compressionLevel);
       default:
