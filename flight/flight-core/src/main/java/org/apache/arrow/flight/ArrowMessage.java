@@ -16,6 +16,8 @@
  */
 package org.apache.arrow.flight;
 
+import static org.apache.arrow.memory.util.LargeMemoryUtil.checkedCastToInt;
+
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.google.protobuf.ByteString;
@@ -48,6 +50,7 @@ import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.util.Preconditions;
+import org.apache.arrow.vector.compression.NoCompressionCodec;
 import org.apache.arrow.vector.ipc.message.ArrowDictionaryBatch;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.ipc.message.IpcOption;
@@ -142,6 +145,8 @@ class ArrowMessage implements AutoCloseable {
   private final MessageMetadataResult message;
   private final ArrowBuf appMetadata;
   private final List<ArrowBuf> bufs;
+  // The body buffers to write; see body().
+  private final List<ByteBuffer> body;
   private final boolean tryZeroCopyWrite;
 
   public ArrowMessage(FlightDescriptor descriptor, Schema schema, IpcOption option) {
@@ -150,6 +155,7 @@ class ArrowMessage implements AutoCloseable {
     this.message =
         MessageMetadataResult.create(serializedMessage.slice(), serializedMessage.remaining());
     bufs = ImmutableList.of();
+    this.body = ImmutableList.of();
     this.descriptor = descriptor;
     this.appMetadata = null;
     this.tryZeroCopyWrite = false;
@@ -169,6 +175,7 @@ class ArrowMessage implements AutoCloseable {
     this.message =
         MessageMetadataResult.create(serializedMessage.slice(), serializedMessage.remaining());
     this.bufs = ImmutableList.copyOf(batch.getBuffers());
+    this.body = body(bufs, batch);
     this.descriptor = null;
     this.appMetadata = appMetadata;
     this.tryZeroCopyWrite = tryZeroCopy;
@@ -182,6 +189,7 @@ class ArrowMessage implements AutoCloseable {
     // asInputStream will free the buffers implicitly, so increment the reference count
     batch.getDictionary().getBuffers().forEach(buf -> buf.getReferenceManager().retain());
     this.bufs = ImmutableList.copyOf(batch.getDictionary().getBuffers());
+    this.body = body(bufs, batch.getDictionary());
     this.descriptor = null;
     this.appMetadata = null;
     this.tryZeroCopyWrite = false;
@@ -197,6 +205,7 @@ class ArrowMessage implements AutoCloseable {
     this.writeOption = IpcOption.DEFAULT;
     this.message = null;
     this.bufs = ImmutableList.of();
+    this.body = ImmutableList.of();
     this.descriptor = null;
     this.appMetadata = appMetadata;
     this.tryZeroCopyWrite = false;
@@ -207,6 +216,7 @@ class ArrowMessage implements AutoCloseable {
     this.writeOption = IpcOption.DEFAULT;
     this.message = null;
     this.bufs = ImmutableList.of();
+    this.body = ImmutableList.of();
     this.descriptor = descriptor;
     this.appMetadata = null;
     this.tryZeroCopyWrite = false;
@@ -228,7 +238,33 @@ class ArrowMessage implements AutoCloseable {
     this.descriptor = descriptor;
     this.appMetadata = appMetadata;
     this.bufs = buf == null ? ImmutableList.of() : ImmutableList.of(buf);
+    this.body = buf == null ? ImmutableList.of() : ImmutableList.of(buf.nioBuffer());
     this.tryZeroCopyWrite = false;
+  }
+
+  /**
+   * The body buffers to write for a batch: views of its buffers, or heap copies if it is
+   * compressed.
+   *
+   * <p>gRPC may serialize a message after the writer has closed it: on the in-process transport,
+   * before a client call is connected, or when a call is retried. That is safe for uncompressed
+   * buffers, which the writer's vectors keep alive, but compressed buffers are owned by the message
+   * alone. Copying them to the heap gives them the same lifetime, managed by the garbage collector.
+   */
+  private static List<ByteBuffer> body(List<ArrowBuf> buffers, ArrowRecordBatch batch) {
+    final boolean compressed =
+        batch.getBodyCompression().getCodec() != NoCompressionCodec.COMPRESSION_TYPE;
+    final ImmutableList.Builder<ByteBuffer> body = ImmutableList.builder();
+    for (ArrowBuf buf : buffers) {
+      if (compressed) {
+        final ByteBuffer copy = ByteBuffer.allocate(checkedCastToInt(buf.readableBytes()));
+        copy.put(buf.nioBuffer()).flip();
+        body.add(copy);
+      } else {
+        body.add(buf.nioBuffer());
+      }
+    }
+    return body.build();
   }
 
   public MessageMetadataResult asSchemaMessage() {
@@ -462,8 +498,9 @@ class ArrowMessage implements AutoCloseable {
     }
 
     try {
+      // Copy from a duplicate, so the message can be serialized again (e.g. when gRPC retries).
       final ByteString bytes =
-          ByteString.copyFrom(message.getMessageBuffer(), message.bytesAfterMessage());
+          ByteString.copyFrom(message.getMessageBuffer().duplicate(), message.bytesAfterMessage());
 
       if (getMessageType() == HeaderType.SCHEMA) {
 
@@ -497,16 +534,16 @@ class ArrowMessage implements AutoCloseable {
       cos.writeTag(FlightData.DATA_BODY_FIELD_NUMBER, WireFormat.WIRETYPE_LENGTH_DELIMITED);
       int size = 0;
       List<ByteBuf> allBufs = new ArrayList<>();
-      for (ArrowBuf b : bufs) {
+      for (ByteBuffer b : body) {
         // [ARROW-11066] This creates a Netty buffer whose refcnt is INDEPENDENT of the backing
         // Arrow buffer. This is susceptible to use-after-free, so we subclass CompositeByteBuf
         // below to tie the Arrow buffer refcnt to the Netty buffer refcnt
-        allBufs.add(Unpooled.wrappedBuffer(b.nioBuffer()).retain());
-        size += (int) b.readableBytes();
+        allBufs.add(Unpooled.wrappedBuffer(b).retain());
+        size += b.remaining();
         // [ARROW-4213] These buffers must be aligned to an 8-byte boundary in order to be readable
         // from C++.
-        if (b.readableBytes() % 8 != 0) {
-          int paddingBytes = (int) (8 - (b.readableBytes() % 8));
+        if (b.remaining() % 8 != 0) {
+          int paddingBytes = 8 - (b.remaining() % 8);
           assert paddingBytes > 0 && paddingBytes < 8;
           size += paddingBytes;
           allBufs.add(PADDING_BUFFERS.get(paddingBytes).retain());

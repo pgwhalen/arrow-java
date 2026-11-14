@@ -69,9 +69,8 @@ public interface OutboundStreamListener {
    *
    * <p>This method must be called before all others, except {@link #putMetadata(ArrowBuf)}.
    *
-   * <p>A server (DoGet, DoExchange) can compress record batch and dictionary batch bodies by
-   * passing e.g. {@code IpcOption.DEFAULT.withCompression(CompressionUtil.CodecType.ZSTD)}. Clients
-   * do not support compression and throw {@link UnsupportedOperationException} for such an option.
+   * <p>Record batch and dictionary batch bodies can be compressed by passing e.g. {@code
+   * IpcOption.DEFAULT.withCompression(CompressionUtil.CodecType.ZSTD)}.
    */
   void start(VectorSchemaRoot root, DictionaryProvider dictionaries, IpcOption option);
 

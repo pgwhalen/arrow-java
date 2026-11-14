@@ -17,12 +17,16 @@
 package org.apache.arrow.flight;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.protobuf.ByteString;
 import io.grpc.ManagedChannel;
+import io.grpc.MethodDescriptor;
+import io.grpc.Server;
+import io.grpc.inprocess.InProcessChannelBuilder;
+import io.grpc.inprocess.InProcessServerBuilder;
 import io.grpc.netty.NettyChannelBuilder;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -31,10 +35,13 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 import org.apache.arrow.flatbuf.Message;
 import org.apache.arrow.flatbuf.MessageHeader;
+import org.apache.arrow.flight.auth.ServerAuthHandler;
 import org.apache.arrow.flight.impl.Flight;
 import org.apache.arrow.flight.impl.FlightServiceGrpc;
 import org.apache.arrow.memory.ArrowBuf;
@@ -44,7 +51,11 @@ import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.ValueVector;
 import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorLoader;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.VectorUnloader;
+import org.apache.arrow.vector.compression.CompressionCodec;
+import org.apache.arrow.vector.compression.CompressionUtil;
 import org.apache.arrow.vector.compression.CompressionUtil.CodecType;
 import org.apache.arrow.vector.dictionary.Dictionary;
 import org.apache.arrow.vector.dictionary.DictionaryEncoder;
@@ -133,15 +144,89 @@ public class TestFlightCompression {
 
   @ParameterizedTest
   @MethodSource("options")
+  public void testDoPut(IpcOption option) throws Exception {
+    putStream(client, option);
+  }
+
+  @ParameterizedTest
+  @MethodSource("options")
   public void testDoExchange(IpcOption option) throws Exception {
     producer.option = option;
     try (final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
         final VectorSchemaRoot root = createRoot(allocator);
         final FlightClient.ExchangeReaderWriter exchange =
             client.doExchange(FlightDescriptor.command(COMMAND))) {
-      // The client writes uncompressed; the server echoes the data compressed with the option.
-      writeStream(exchange.getWriter(), root, provider, IpcOption.DEFAULT);
+      // Both sides compress: the server echoes the client's data.
+      writeStream(exchange.getWriter(), root, provider, option);
       verifyStream(exchange.getReader());
+    }
+  }
+
+  /**
+   * The in-process transport hands the serialized message to the reader without copying it, so it
+   * is read after the writer has closed the message.
+   */
+  @ParameterizedTest
+  @MethodSource("options")
+  public void testInProcess(IpcOption option) throws Exception {
+    producer.option = option;
+    final String name = InProcessServerBuilder.generateName();
+    final ExecutorService executor = Executors.newCachedThreadPool();
+    final Server inProcessServer =
+        InProcessServerBuilder.forName(name)
+            .addService(
+                FlightGrpcUtils.createFlightService(
+                    allocator, producer, ServerAuthHandler.NO_OP, executor))
+            .build()
+            .start();
+    try (final FlightClient inProcessClient =
+        FlightGrpcUtils.createFlightClient(
+            allocator, InProcessChannelBuilder.forName(name).build())) {
+      try (final FlightStream stream = inProcessClient.getStream(new Ticket(COMMAND))) {
+        verifyStream(stream);
+      }
+      putStream(inProcessClient, option);
+    } finally {
+      inProcessServer.shutdownNow().awaitTermination(30, TimeUnit.SECONDS);
+      executor.shutdownNow();
+    }
+  }
+
+  /**
+   * gRPC may serialize a message after the writer has closed it: on the in-process transport,
+   * before a client call is connected, or again when a call is retried. Compressed messages must
+   * stay serializable then, like uncompressed ones whose vectors are still alive.
+   */
+  @ParameterizedTest
+  @MethodSource("options")
+  public void testSerializeAfterClose(IpcOption option) throws Exception {
+    final MethodDescriptor.Marshaller<ArrowMessage> marshaller =
+        ArrowMessage.createMarshaller(allocator);
+    try (final VectorSchemaRoot root = createRoot(allocator);
+        final VectorSchemaRoot received = VectorSchemaRoot.create(SCHEMA, allocator)) {
+      final CompressionCodec codec =
+          CompressionUtil.createCodec(
+              CompressionCodec.Factory.INSTANCE, option.codecType, option.compressionLevel);
+      final ArrowMessage message =
+          new ArrowMessage(
+              new VectorUnloader(root, /* includeNullCount */ true, codec, /* alignBuffers */ true)
+                  .getRecordBatch(),
+              /* appMetadata */ null,
+              /* tryZeroCopy */ false,
+              option);
+      message.close();
+      // Serialize twice, as a retry would.
+      for (int attempt = 0; attempt < 2; attempt++) {
+        try (final InputStream stream = marshaller.stream(message);
+            final ArrowMessage parsed = marshaller.parse(stream);
+            final ArrowRecordBatch batch = parsed.asRecordBatch()) {
+          new VectorLoader(received).load(batch);
+          final IntVector ints = (IntVector) received.getVector("i");
+          for (int row = 0; row < ROWS; row++) {
+            assertEquals(row % 16, ints.get(row));
+          }
+        }
+      }
     }
   }
 
@@ -165,43 +250,17 @@ public class TestFlightCompression {
     verifyWireFormat(option, messages);
   }
 
-  static Stream<IpcOption> compressedOptions() {
-    return options().filter(option -> option.codecType != CodecType.NO_COMPRESSION);
-  }
-
-  /**
-   * A client cannot compress DoPut data. The option is rejected before anything is sent, so the
-   * stream can still be started without compression.
-   */
-  @ParameterizedTest
-  @MethodSource("compressedOptions")
-  public void testDoPutRejectsCompression(IpcOption option) throws Exception {
+  /** DoPut the root with the given option, which the producer verifies. */
+  private void putStream(FlightClient client, IpcOption option) throws Exception {
+    producer.verifiedPutBatches = 0;
     try (final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
         final VectorSchemaRoot root = createRoot(allocator)) {
       final FlightClient.ClientStreamListener listener =
           client.startPut(FlightDescriptor.command(COMMAND), new AsyncPutListener());
-      assertThrows(
-          UnsupportedOperationException.class, () -> listener.start(root, provider, option));
-      writeStream(listener, root, provider, IpcOption.DEFAULT);
+      writeStream(listener, root, provider, option);
       listener.getResult();
     }
     assertEquals(BATCHES, producer.verifiedPutBatches);
-  }
-
-  /** As {@link #testDoPutRejectsCompression}, for the client side of DoExchange. */
-  @ParameterizedTest
-  @MethodSource("compressedOptions")
-  public void testDoExchangeClientRejectsCompression(IpcOption option) throws Exception {
-    try (final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
-        final VectorSchemaRoot root = createRoot(allocator);
-        final FlightClient.ExchangeReaderWriter exchange =
-            client.doExchange(FlightDescriptor.command(COMMAND))) {
-      assertThrows(
-          UnsupportedOperationException.class,
-          () -> exchange.getWriter().start(root, provider, option));
-      writeStream(exchange.getWriter(), root, provider, IpcOption.DEFAULT);
-      verifyStream(exchange.getReader());
-    }
   }
 
   private FlightClient newClient(int port) {
