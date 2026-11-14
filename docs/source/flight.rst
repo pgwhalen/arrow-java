@@ -168,9 +168,9 @@ and if so, break out of any processing the server is currently doing.
 Compression
 ===========
 
-Record batch and dictionary batch bodies can be compressed with ZSTD or LZ4_FRAME
-by passing an ``IpcOption`` to ``start``, on either the server (DoGet, DoExchange)
-or the client (DoPut, DoExchange). This is equivalent to PyArrow's
+A server can compress the record batch and dictionary batch bodies it sends
+(DoGet, DoExchange) with ZSTD or LZ4_FRAME by passing an ``IpcOption`` to
+``start``. This is equivalent to PyArrow's
 ``pa.ipc.IpcWriteOptions(compression="zstd")``.
 
 .. code-block:: Java
@@ -179,7 +179,12 @@ or the client (DoPut, DoExchange). This is equivalent to PyArrow's
         IpcOption.DEFAULT.withCompression(CompressionUtil.CodecType.ZSTD));
 
 Codecs are provided by the ``arrow-compression`` module, which must be on the
-classpath of writers and readers. ``FlightStream`` decompresses automatically.
+classpath of writers and readers. ``FlightStream`` decompresses automatically,
+so clients can read compressed data from any server, including C++ and Python
+servers.
+
+Compressing data written by a client (DoPut, DoExchange) is not yet supported;
+``start`` throws ``UnsupportedOperationException`` for such an option.
 
 Enabling TLS
 ============

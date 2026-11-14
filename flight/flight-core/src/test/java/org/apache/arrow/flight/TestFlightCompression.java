@@ -21,16 +21,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.protobuf.ByteString;
-import io.grpc.EquivalentAddressGroup;
 import io.grpc.ManagedChannel;
-import io.grpc.NameResolver;
-import io.grpc.Server;
 import io.grpc.netty.NettyChannelBuilder;
-import io.grpc.netty.NettyServerBuilder;
-import io.grpc.stub.StreamObserver;
-import java.net.InetSocketAddress;
-import java.net.SocketAddress;
-import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -39,9 +31,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.stream.Stream;
 import org.apache.arrow.flatbuf.Message;
 import org.apache.arrow.flatbuf.MessageHeader;
@@ -69,7 +59,6 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
@@ -131,17 +120,15 @@ public class TestFlightCompression {
     }
   }
 
+  /** As {@link #testDoGet}, with the zero-copy write path, which retains the compressed buffers. */
   @ParameterizedTest
   @MethodSource("options")
-  public void testDoPut(IpcOption option) throws Exception {
-    try (final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
-        final VectorSchemaRoot root = createRoot(allocator)) {
-      final FlightClient.ClientStreamListener listener =
-          client.startPut(FlightDescriptor.command(COMMAND), new AsyncPutListener());
-      writeStream(listener, root, provider, option);
-      listener.getResult();
+  public void testDoGetZeroCopy(IpcOption option) throws Exception {
+    producer.option = option;
+    producer.zeroCopy = true;
+    try (final FlightStream stream = client.getStream(new Ticket(COMMAND))) {
+      verifyStream(stream);
     }
-    assertEquals(BATCHES, producer.verifiedPutBatches);
   }
 
   @ParameterizedTest
@@ -152,8 +139,8 @@ public class TestFlightCompression {
         final VectorSchemaRoot root = createRoot(allocator);
         final FlightClient.ExchangeReaderWriter exchange =
             client.doExchange(FlightDescriptor.command(COMMAND))) {
-      // The server echoes what the client writes; both sides compress with the same option.
-      writeStream(exchange.getWriter(), root, provider, option);
+      // The client writes uncompressed; the server echoes the data compressed with the option.
+      writeStream(exchange.getWriter(), root, provider, IpcOption.DEFAULT);
       verifyStream(exchange.getReader());
     }
   }
@@ -178,59 +165,43 @@ public class TestFlightCompression {
     verifyWireFormat(option, messages);
   }
 
-  /** A client writing DoPut compresses dictionary batches and record batches. */
-  @ParameterizedTest
-  @MethodSource("options")
-  public void testClientWireFormat(IpcOption option) throws Exception {
-    final List<Flight.FlightData> messages = Collections.synchronizedList(new ArrayList<>());
-    final Server rawServer =
-        NettyServerBuilder.forAddress(new InetSocketAddress(FlightTestUtil.LOCALHOST, 0))
-            .addService(new CapturingFlightService(messages))
-            .build()
-            .start();
-    try (final FlightClient rawClient = newClient(rawServer.getPort());
-        final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
-        final VectorSchemaRoot root = createRoot(allocator)) {
-      final FlightClient.ClientStreamListener listener =
-          rawClient.startPut(FlightDescriptor.command(COMMAND), new AsyncPutListener());
-      writeStream(listener, root, provider, option);
-      listener.getResult();
-    } finally {
-      rawServer.shutdownNow().awaitTermination(30, TimeUnit.SECONDS);
-    }
-    verifyWireFormat(option, messages);
+  static Stream<IpcOption> compressedOptions() {
+    return options().filter(option -> option.codecType != CodecType.NO_COMPRESSION);
   }
 
   /**
-   * A client may start writing, including compressed dictionaries, before its call is connected, in
-   * which case gRPC queues messages to serialize later. They must not be freed before that.
+   * A client cannot compress DoPut data. The option is rejected before anything is sent, so the
+   * stream can still be started without compression.
    */
-  @Test
-  public void testClientWritesBeforeConnected() throws Exception {
-    final IpcOption option = IpcOption.DEFAULT.withCompression(CodecType.ZSTD);
-    final ManualNameResolver resolver =
-        new ManualNameResolver(new InetSocketAddress(FlightTestUtil.LOCALHOST, server.getPort()));
-    final ManagedChannel channel =
-        NettyChannelBuilder.forTarget("manual:///flight")
-            .nameResolverFactory(resolver.factory())
-            .usePlaintext()
-            .build();
-    try (final FlightClient pendingClient = FlightGrpcUtils.createFlightClient(allocator, channel);
-        final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
+  @ParameterizedTest
+  @MethodSource("compressedOptions")
+  public void testDoPutRejectsCompression(IpcOption option) throws Exception {
+    try (final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
         final VectorSchemaRoot root = createRoot(allocator)) {
       final FlightClient.ClientStreamListener listener =
-          pendingClient.startPut(FlightDescriptor.command(COMMAND), new AsyncPutListener());
-      final CompletableFuture<Void> writer =
-          CompletableFuture.runAsync(() -> writeStream(listener, root, provider, option));
-      // The writer cannot finish until the call is connected, which requires name resolution.
-      assertThrows(TimeoutException.class, () -> writer.get(1, TimeUnit.SECONDS));
-      resolver.resolve();
-      writer.get(30, TimeUnit.SECONDS);
+          client.startPut(FlightDescriptor.command(COMMAND), new AsyncPutListener());
+      assertThrows(
+          UnsupportedOperationException.class, () -> listener.start(root, provider, option));
+      writeStream(listener, root, provider, IpcOption.DEFAULT);
       listener.getResult();
-    } finally {
-      channel.shutdownNow().awaitTermination(30, TimeUnit.SECONDS);
     }
     assertEquals(BATCHES, producer.verifiedPutBatches);
+  }
+
+  /** As {@link #testDoPutRejectsCompression}, for the client side of DoExchange. */
+  @ParameterizedTest
+  @MethodSource("compressedOptions")
+  public void testDoExchangeClientRejectsCompression(IpcOption option) throws Exception {
+    try (final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
+        final VectorSchemaRoot root = createRoot(allocator);
+        final FlightClient.ExchangeReaderWriter exchange =
+            client.doExchange(FlightDescriptor.command(COMMAND))) {
+      assertThrows(
+          UnsupportedOperationException.class,
+          () -> exchange.getWriter().start(root, provider, option));
+      writeStream(exchange.getWriter(), root, provider, IpcOption.DEFAULT);
+      verifyStream(exchange.getReader());
+    }
   }
 
   private FlightClient newClient(int port) {
@@ -270,12 +241,7 @@ public class TestFlightCompression {
     return root;
   }
 
-  /**
-   * Send the root {@link #BATCHES} times, then complete the stream.
-   *
-   * <p>Callers create the root before the call, so that a client starts writing (including
-   * compressed dictionaries) while its call may not be connected yet.
-   */
+  /** Send the root {@link #BATCHES} times, then complete the stream. */
   private static void writeStream(
       OutboundStreamListener listener,
       VectorSchemaRoot root,
@@ -330,10 +296,9 @@ public class TestFlightCompression {
     for (Flight.FlightData message : data.subList(1, data.size())) {
       try (final ArrowRecordBatch batch = deserializeBatch(message)) {
         assertEquals(
-            option.getCodecType(),
-            CodecType.fromCompressionType(batch.getBodyCompression().getCodec()));
+            option.codecType, CodecType.fromCompressionType(batch.getBodyCompression().getCodec()));
         if (header(message).headerType() == MessageHeader.RecordBatch
-            && option.getCodecType() != CodecType.NO_COMPRESSION) {
+            && option.codecType != CodecType.NO_COMPRESSION) {
           // Buffers are i (validity, data), encoded (validity, data). A compressed buffer is
           // prefixed by its uncompressed length, or -1 if it was left uncompressed.
           final ArrowBuf intData = batch.getBuffers().get(1);
@@ -371,6 +336,7 @@ public class TestFlightCompression {
   static class Producer extends NoOpFlightProducer {
     private final BufferAllocator allocator;
     volatile IpcOption option = IpcOption.DEFAULT;
+    volatile boolean zeroCopy = false;
     volatile int verifiedPutBatches = 0;
 
     Producer(BufferAllocator allocator) {
@@ -381,6 +347,7 @@ public class TestFlightCompression {
     public void getStream(CallContext context, Ticket ticket, ServerStreamListener listener) {
       try (final DictionaryProvider.MapDictionaryProvider provider = createProvider(allocator);
           final VectorSchemaRoot root = createRoot(allocator)) {
+        listener.setUseZeroCopy(zeroCopy);
         writeStream(listener, root, provider, option);
       }
     }
@@ -410,80 +377,6 @@ public class TestFlightCompression {
         } while (reader.next());
       }
       writer.completed();
-    }
-  }
-
-  /** A name resolver that only resolves its target when {@link #resolve()} is called. */
-  static class ManualNameResolver extends NameResolver {
-    private final SocketAddress address;
-    private volatile Listener2 listener;
-
-    ManualNameResolver(SocketAddress address) {
-      this.address = address;
-    }
-
-    @Override
-    public String getServiceAuthority() {
-      return FlightTestUtil.LOCALHOST;
-    }
-
-    @Override
-    public void start(Listener2 listener) {
-      this.listener = listener;
-    }
-
-    @Override
-    public void shutdown() {}
-
-    void resolve() {
-      listener.onResult(
-          ResolutionResult.newBuilder()
-              .setAddresses(Collections.singletonList(new EquivalentAddressGroup(address)))
-              .build());
-    }
-
-    NameResolver.Factory factory() {
-      return new NameResolver.Factory() {
-        @Override
-        public NameResolver newNameResolver(URI targetUri, Args args) {
-          return ManualNameResolver.this;
-        }
-
-        @Override
-        public String getDefaultScheme() {
-          return "manual";
-        }
-      };
-    }
-  }
-
-  /** A raw gRPC Flight service that records the DoPut messages it receives. */
-  static class CapturingFlightService extends FlightServiceGrpc.FlightServiceImplBase {
-    private final List<Flight.FlightData> received;
-
-    CapturingFlightService(List<Flight.FlightData> received) {
-      this.received = received;
-    }
-
-    @Override
-    public StreamObserver<Flight.FlightData> doPut(
-        StreamObserver<Flight.PutResult> responseObserver) {
-      return new StreamObserver<Flight.FlightData>() {
-        @Override
-        public void onNext(Flight.FlightData value) {
-          received.add(value);
-        }
-
-        @Override
-        public void onError(Throwable t) {
-          responseObserver.onError(t);
-        }
-
-        @Override
-        public void onCompleted() {
-          responseObserver.onCompleted();
-        }
-      };
     }
   }
 }

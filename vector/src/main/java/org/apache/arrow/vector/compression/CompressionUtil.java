@@ -16,6 +16,7 @@
  */
 package org.apache.arrow.vector.compression;
 
+import java.util.Optional;
 import org.apache.arrow.flatbuf.BodyCompressionMethod;
 import org.apache.arrow.flatbuf.CompressionType;
 import org.apache.arrow.memory.ArrowBuf;
@@ -89,5 +90,21 @@ public class CompressionUtil {
   public static ArrowBuf extractUncompressedBuffer(ArrowBuf inputBuffer) {
     return inputBuffer.slice(
         SIZE_OF_UNCOMPRESSED_LENGTH, inputBuffer.writerIndex() - SIZE_OF_UNCOMPRESSED_LENGTH);
+  }
+
+  /**
+   * Creates a codec from the given factory, using the compression level if present and the codec's
+   * default level otherwise.
+   *
+   * @param factory the factory that creates the codec
+   * @param codecType the codec type
+   * @param compressionLevel the codec-specific compression level, or empty for the default
+   * @return the codec
+   */
+  public static CompressionCodec createCodec(
+      CompressionCodec.Factory factory, CodecType codecType, Optional<Integer> compressionLevel) {
+    return compressionLevel.isPresent()
+        ? factory.createCodec(codecType, compressionLevel.get())
+        : factory.createCodec(codecType);
   }
 }

@@ -72,6 +72,19 @@ public abstract class ArrowWriter implements AutoCloseable {
     this(root, provider, out, IpcOption.DEFAULT);
   }
 
+  /**
+   * Note: fields are not closed when the writer is closed.
+   *
+   * <p>If {@code option} requests body compression (see {@link
+   * IpcOption#withCompression(CompressionUtil.CodecType)}), the codec is obtained from {@link
+   * CompressionCodec.Factory#INSTANCE}, which requires a codec implementation such as the {@code
+   * arrow-compression} module on the classpath; otherwise creating the writer fails.
+   *
+   * @param root the vectors to write to the output
+   * @param provider where to find the dictionaries
+   * @param out the output where to write
+   * @param option IPC write options
+   */
   protected ArrowWriter(
       VectorSchemaRoot root,
       DictionaryProvider provider,
@@ -82,13 +95,20 @@ public abstract class ArrowWriter implements AutoCloseable {
         provider,
         out,
         option,
-        NoCompressionCodec.Factory.INSTANCE,
-        CompressionUtil.CodecType.NO_COMPRESSION,
-        Optional.empty());
+        option.codecType == CompressionUtil.CodecType.NO_COMPRESSION
+            ? NoCompressionCodec.Factory.INSTANCE
+            : CompressionCodec.Factory.INSTANCE,
+        option.codecType,
+        option.compressionLevel);
   }
 
   /**
    * Note: fields are not closed when the writer is closed.
+   *
+   * <p>If {@code option} requests body compression, {@code codecType} and {@code compressionLevel}
+   * must match the option's codec and level, and {@code compressionFactory} is used to create that
+   * codec. If {@code option} does not request compression, the explicit arguments are used as
+   * given.
    *
    * @param root the vectors to write to the output
    * @param provider where to find the dictionaries
@@ -97,6 +117,8 @@ public abstract class ArrowWriter implements AutoCloseable {
    * @param compressionFactory Compression codec factory
    * @param codecType Compression codec
    * @param compressionLevel Compression level
+   * @throws IllegalArgumentException if {@code option} requests compression that differs from
+   *     {@code codecType} or {@code compressionLevel}
    */
   protected ArrowWriter(
       VectorSchemaRoot root,
@@ -106,6 +128,7 @@ public abstract class ArrowWriter implements AutoCloseable {
       CompressionCodec.Factory compressionFactory,
       CompressionUtil.CodecType codecType,
       Optional<Integer> compressionLevel) {
+    checkCompressionAgreesWithOption(option, codecType, compressionLevel);
     this.out = new WriteChannel(out);
     this.option = option;
     this.dictionaryProvider = provider;
@@ -114,9 +137,7 @@ public abstract class ArrowWriter implements AutoCloseable {
     this.codecType = codecType;
     this.compressionLevel = compressionLevel;
     this.codec =
-        this.compressionLevel.isPresent()
-            ? this.compressionFactory.createCodec(this.codecType, this.compressionLevel.get())
-            : this.compressionFactory.createCodec(this.codecType);
+        CompressionUtil.createCodec(this.compressionFactory, this.codecType, this.compressionLevel);
     this.unloader =
         new VectorUnloader(root, /*includeNullCount*/ true, codec, /*alignBuffers*/ true);
 
@@ -130,6 +151,25 @@ public abstract class ArrowWriter implements AutoCloseable {
     }
 
     this.schema = new Schema(fields, root.getSchema().getCustomMetadata());
+  }
+
+  private static void checkCompressionAgreesWithOption(
+      IpcOption option, CompressionUtil.CodecType codecType, Optional<Integer> compressionLevel) {
+    if (option.codecType == CompressionUtil.CodecType.NO_COMPRESSION) {
+      // The option does not request compression: the explicit arguments apply as given.
+      return;
+    }
+    if (option.codecType != codecType || !option.compressionLevel.equals(compressionLevel)) {
+      throw new IllegalArgumentException(
+          "IpcOption requests compression with codec "
+              + option.codecType
+              + " and level "
+              + option.compressionLevel
+              + ", which conflicts with the explicitly passed codec "
+              + codecType
+              + " and level "
+              + compressionLevel);
+    }
   }
 
   public void start() throws IOException {

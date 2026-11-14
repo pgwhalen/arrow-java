@@ -60,8 +60,10 @@ import org.apache.arrow.flight.impl.FlightServiceGrpc.FlightServiceStub;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.compression.CompressionUtil;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.dictionary.DictionaryProvider.MapDictionaryProvider;
+import org.apache.arrow.vector.ipc.message.IpcOption;
 
 /** Client for Flight services. */
 public class FlightClient implements AutoCloseable {
@@ -247,6 +249,10 @@ public class FlightClient implements AutoCloseable {
   /**
    * Create or append a descriptor with another stream.
    *
+   * <p>Compressing the uploaded data is not supported: {@link
+   * ClientStreamListener#start(VectorSchemaRoot, DictionaryProvider, IpcOption)} throws {@link
+   * UnsupportedOperationException} for an {@link IpcOption} that requests body compression.
+   *
    * @param descriptor FlightDescriptor the descriptor for the data
    * @param metadataListener A handler for metadata messages from the server.
    * @param options RPC-layer hints for this call.
@@ -373,6 +379,11 @@ public class FlightClient implements AutoCloseable {
 
   /**
    * Initiate a bidirectional data exchange with the server.
+   *
+   * <p>The server may compress the data it sends, which the reader decompresses. Compressing the
+   * data written by the client is not supported: {@link
+   * ClientStreamListener#start(VectorSchemaRoot, DictionaryProvider, IpcOption)} throws {@link
+   * UnsupportedOperationException} for an {@link IpcOption} that requests body compression.
    *
    * @param descriptor A descriptor for the data stream.
    * @param options RPC call options.
@@ -525,6 +536,25 @@ public class FlightClient implements AutoCloseable {
       while (!responseObserver.isReady() && !isCancelled.getAsBoolean()) {
         /* busy wait */
       }
+    }
+
+    /**
+     * Start sending data.
+     *
+     * @throws UnsupportedOperationException if {@code option} requests body compression, which is
+     *     not supported for client writes. Nothing is sent in that case.
+     */
+    @Override
+    public void start(VectorSchemaRoot root, DictionaryProvider dictionaries, IpcOption option) {
+      // gRPC may serialize a client's message after the writer has freed it (before the call is
+      // connected, or when a retry replays it), which is only safe while the message references
+      // buffers that the vectors keep alive. Compressed buffers are owned by the message alone.
+      if (option.codecType != CompressionUtil.CodecType.NO_COMPRESSION) {
+        throw new UnsupportedOperationException(
+            "IPC body compression is only supported for data written by a Flight server, not by a"
+                + " client");
+      }
+      super.start(root, dictionaries, option);
     }
 
     @Override
@@ -693,7 +723,13 @@ public class FlightClient implements AutoCloseable {
     return result;
   }
 
-  /** Interface for writers to an Arrow data stream. */
+  /**
+   * Interface for writers to an Arrow data stream.
+   *
+   * <p>Body compression is not supported for data written by a client: {@link
+   * #start(VectorSchemaRoot, DictionaryProvider, IpcOption)} throws {@link
+   * UnsupportedOperationException} for an {@link IpcOption} that requests it.
+   */
   public interface ClientStreamListener extends OutboundStreamListener {
 
     /**

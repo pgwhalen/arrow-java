@@ -200,3 +200,25 @@ number of record batches in the file, and can read any at random
       reader.loadRecordBatch(block);
       VectorSchemaRoot readBatch = reader.getVectorSchemaRoot();
     }
+
+Compression
+~~~~~~~~~~~
+Record batch and dictionary batch bodies can be compressed with ZSTD or LZ4_FRAME by passing an
+``IpcOption`` to :class:`ArrowStreamWriter` or :class:`ArrowFileWriter`. This is equivalent to
+PyArrow's ``pa.ipc.IpcWriteOptions(compression="zstd")``.
+
+.. code-block:: Java
+
+    IpcOption option = IpcOption.DEFAULT.withCompression(CompressionUtil.CodecType.ZSTD);
+    // or with a codec-specific compression level:
+    // IpcOption.DEFAULT.withCompression(CompressionUtil.CodecType.ZSTD, 3);
+    try (ArrowStreamWriter writer =
+        new ArrowStreamWriter(root, /*DictionaryProvider=*/null, Channels.newChannel(out), option)) {
+      writer.start();
+      writer.writeBatch();
+      writer.end();
+    }
+
+Codecs are provided by the ``arrow-compression`` module, which must be on the classpath of writers
+and readers; readers decompress automatically. Body compression is part of metadata version V5, so
+it cannot be combined with ``MetadataVersion.V4`` or the legacy (pre-0.15.0) IPC format.
