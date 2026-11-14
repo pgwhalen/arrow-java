@@ -69,8 +69,8 @@ public class IpcOption {
    * the given codec, like {@code IpcWriteOptions(compression=...)} in PyArrow.
    *
    * <p>Honored by {@link org.apache.arrow.vector.ipc.ArrowStreamWriter}, {@link
-   * org.apache.arrow.vector.ipc.ArrowFileWriter} and Arrow Flight servers. Requires a codec
-   * implementation (e.g. the {@code arrow-compression} module) at runtime.
+   * org.apache.arrow.vector.ipc.ArrowFileWriter}, and Arrow Flight clients and servers. Requires a
+   * codec implementation (e.g. the {@code arrow-compression} module) at runtime.
    *
    * <p>Body compression is part of metadata version V5, so a codec other than {@code
    * NO_COMPRESSION} requires {@link MetadataVersion#V5} and the non-legacy IPC format. Passing
@@ -85,18 +85,27 @@ public class IpcOption {
   }
 
   /**
-   * Like {@link #withCompression(CompressionUtil.CodecType)}, with a codec-specific level.
+   * Like {@link #withCompression(CompressionUtil.CodecType)}, with a codec-specific level. Only
+   * codecs that have levels accept one (see {@link #supportsCompressionLevel}): ZSTD does; {@code
+   * NO_COMPRESSION} and LZ4_FRAME do not.
    *
-   * @throws IllegalArgumentException if {@code codecType} is {@code NO_COMPRESSION}, or under the
+   * @throws IllegalArgumentException if {@code codecType} has no compression level, or under the
    *     same conditions as {@link #withCompression(CompressionUtil.CodecType)}
    */
   public IpcOption withCompression(CompressionUtil.CodecType codecType, int compressionLevel) {
+    Preconditions.checkNotNull(codecType, "codecType must not be null");
     Preconditions.checkArgument(
-        codecType != CompressionUtil.CodecType.NO_COMPRESSION,
-        "A compression level cannot be used with NO_COMPRESSION");
+        supportsCompressionLevel(codecType),
+        "%s has no compression level, so a level cannot be used with it",
+        codecType);
     checkCompressionSupported(codecType);
     return new IpcOption(
         write_legacy_ipc_format, metadataVersion, codecType, Optional.of(compressionLevel));
+  }
+
+  /** Whether {@code codecType} has a compression level that changes how it compresses. */
+  public static boolean supportsCompressionLevel(CompressionUtil.CodecType codecType) {
+    return codecType == CompressionUtil.CodecType.ZSTD;
   }
 
   private void checkCompressionSupported(CompressionUtil.CodecType codecType) {

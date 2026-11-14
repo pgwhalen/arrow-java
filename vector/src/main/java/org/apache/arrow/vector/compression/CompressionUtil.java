@@ -22,6 +22,7 @@ import org.apache.arrow.flatbuf.CompressionType;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.ipc.message.ArrowBodyCompression;
+import org.apache.arrow.vector.ipc.message.IpcOption;
 
 /** Utilities for data compression/decompression. */
 public class CompressionUtil {
@@ -113,10 +114,31 @@ public class CompressionUtil {
    * @param compressionLevel the codec-specific compression level, or empty for the default
    * @return the codec
    */
-  public static CompressionCodec createCodec(
+  private static CompressionCodec createCodec(
       CompressionCodec.Factory factory, CodecType codecType, Optional<Integer> compressionLevel) {
     return compressionLevel.isPresent()
         ? factory.createCodec(codecType, compressionLevel.get())
         : factory.createCodec(codecType);
+  }
+
+  /**
+   * Creates the codec that {@code option} requests, from {@link #defaultFactory}.
+   *
+   * @param option the IPC options naming the codec and level
+   * @return the codec; a no-op codec if the option does not request compression
+   */
+  public static CompressionCodec createCodec(IpcOption option) {
+    return createCodec(defaultFactory(option.codecType), option);
+  }
+
+  /**
+   * Creates the codec that {@code option} requests, from the given factory.
+   *
+   * @param factory the factory that creates the codec
+   * @param option the IPC options naming the codec and level
+   * @return the codec
+   */
+  public static CompressionCodec createCodec(CompressionCodec.Factory factory, IpcOption option) {
+    return createCodec(factory, option.codecType, option.compressionLevel);
   }
 }

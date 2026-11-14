@@ -334,6 +334,83 @@ public class TestArrowWriterCompressionOption extends BaseFileTest {
     assertEquals(Arrays.asList(3, 5, null), levels);
   }
 
+  /**
+   * The explicit-codec constructors validate the codec like {@link IpcOption#withCompression}: they
+   * previously wrote compressed bodies with V4 metadata or the legacy format.
+   */
+  @Test
+  public void testExplicitCompressionRejectedForV4AndLegacyFormat() {
+    try (VectorSchemaRoot root = createRoot()) {
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      for (IpcOption option :
+          List.of(
+              new IpcOption(false, MetadataVersion.V4),
+              new IpcOption(true, MetadataVersion.V4),
+              new IpcOption(true, MetadataVersion.V5))) {
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                new ArrowStreamWriter(
+                    root,
+                    null,
+                    Channels.newChannel(out),
+                    option,
+                    IDENTITY_FACTORY,
+                    CodecType.ZSTD));
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                new ArrowFileWriter(
+                    root,
+                    null,
+                    Channels.newChannel(out),
+                    null,
+                    option,
+                    IDENTITY_FACTORY,
+                    CodecType.ZSTD,
+                    Optional.of(3)));
+      }
+    }
+  }
+
+  /**
+   * An explicit level is dropped where it has no effect, as before {@link IpcOption} carried
+   * compression, rather than rejected as {@link IpcOption#withCompression} rejects it.
+   */
+  @Test
+  public void testExplicitLevelWithoutEffectIsDropped() throws IOException {
+    List<String> created = new ArrayList<>();
+    CompressionCodec.Factory recordingFactory =
+        new CompressionCodec.Factory() {
+          @Override
+          public CompressionCodec createCodec(CodecType codecType) {
+            created.add(codecType.name());
+            return IDENTITY_FACTORY.createCodec(codecType);
+          }
+
+          @Override
+          public CompressionCodec createCodec(CodecType codecType, int compressionLevel) {
+            created.add(codecType.name() + "/" + compressionLevel);
+            return IDENTITY_FACTORY.createCodec(codecType, compressionLevel);
+          }
+        };
+    try (VectorSchemaRoot root = createRoot()) {
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      for (CodecType codecType : List.of(CodecType.LZ4_FRAME, CodecType.NO_COMPRESSION)) {
+        new ArrowStreamWriter(
+                root,
+                null,
+                Channels.newChannel(out),
+                IpcOption.DEFAULT,
+                recordingFactory,
+                codecType,
+                Optional.of(1))
+            .close();
+      }
+    }
+    assertEquals(List.of("LZ4_FRAME", "NO_COMPRESSION"), created);
+  }
+
   @Test
   public void testExplicitArgsAgreeingWithOptionUseExplicitFactory() throws IOException {
     IpcOption zstd3 = IpcOption.DEFAULT.withCompression(CodecType.ZSTD, 3);
@@ -393,8 +470,7 @@ public class TestArrowWriterCompressionOption extends BaseFileTest {
       IllegalArgumentException e =
           assertThrows(IllegalArgumentException.class, () -> base.withCompression(CodecType.ZSTD));
       assertNotNull(e.getMessage());
-      assertThrows(
-          IllegalArgumentException.class, () -> base.withCompression(CodecType.LZ4_FRAME, 1));
+      assertThrows(IllegalArgumentException.class, () -> base.withCompression(CodecType.ZSTD, 1));
     }
 
     // With V5 and the current format, the same writer output is stamped V5.

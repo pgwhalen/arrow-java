@@ -56,11 +56,7 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
   @Override
   public void start(VectorSchemaRoot root, DictionaryProvider dictionaries, IpcOption option) {
     this.option = option;
-    final CompressionCodec codec =
-        CompressionUtil.createCodec(
-            CompressionUtil.defaultFactory(option.codecType),
-            option.codecType,
-            option.compressionLevel);
+    final CompressionCodec codec = CompressionUtil.createCodec(option);
     try {
       DictionaryUtils.generateSchemaMessages(
           root.getSchema(), descriptor, dictionaries, option, codec, this::send);

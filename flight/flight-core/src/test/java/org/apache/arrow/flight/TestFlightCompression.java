@@ -454,9 +454,7 @@ public class TestFlightCompression {
   }
 
   private static ArrowRecordBatch recordBatch(VectorSchemaRoot root, IpcOption option) {
-    final CompressionCodec codec =
-        CompressionUtil.createCodec(
-            CompressionCodec.Factory.INSTANCE, option.codecType, option.compressionLevel);
+    final CompressionCodec codec = CompressionUtil.createCodec(option);
     return new VectorUnloader(root, /* includeNullCount */ true, codec, /* alignBuffers */ true)
         .getRecordBatch();
   }
