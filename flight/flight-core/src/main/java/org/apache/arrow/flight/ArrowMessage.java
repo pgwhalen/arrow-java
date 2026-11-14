@@ -444,11 +444,22 @@ class ArrowMessage implements AutoCloseable {
   /**
    * Convert the ArrowMessage to an InputStream.
    *
-   * <p>Implicitly, this transfers ownership of the contained buffers to the InputStream.
+   * <p>The stream holds its own references to the body buffers, released when gRPC releases the
+   * stream, so it stays valid after this message is closed. gRPC relies on that: it may read a
+   * stream after the writer has closed the message, e.g. on the in-process transport or while a
+   * client call is not yet connected.
+   *
+   * <p>gRPC may also call this more than once, when it retries a client call, and possibly after
+   * this message was closed. That works as long as the buffers are still alive, e.g. uncompressed
+   * buffers whose vectors have not been cleared. Buffers owned by this message alone, such as
+   * compressed bodies and app metadata, are freed by {@link #close()}; serializing then fails
+   * rather than reading freed memory.
    *
    * @return InputStream
    */
   private InputStream asInputStream() {
+    checkAlive(appMetadata);
+    bufs.forEach(ArrowMessage::checkAlive);
     if (message == null) {
       // If we have no IPC message, it's a pure-metadata message
       final FlightData.Builder builder = FlightData.newBuilder();
@@ -462,8 +473,9 @@ class ArrowMessage implements AutoCloseable {
     }
 
     try {
+      // Copy from a duplicate, so the message can be serialized again (e.g. when gRPC retries).
       final ByteString bytes =
-          ByteString.copyFrom(message.getMessageBuffer(), message.bytesAfterMessage());
+          ByteString.copyFrom(message.getMessageBuffer().duplicate(), message.bytesAfterMessage());
 
       if (getMessageType() == HeaderType.SCHEMA) {
 
@@ -518,7 +530,6 @@ class ArrowMessage implements AutoCloseable {
 
       ByteBuf initialBuf = Unpooled.buffer(baos.size());
       initialBuf.writeBytes(baos.toByteArray());
-      final CompositeByteBuf bb;
       final ImmutableList<ByteBuf> byteBufs =
           ImmutableList.<ByteBuf>builder().add(initialBuf).addAll(allBufs).build();
       // See: https://github.com/apache/arrow/issues/40039
@@ -542,17 +553,22 @@ class ArrowMessage implements AutoCloseable {
       // large CompositeByteBuf we're creating here.
       // We never want additional memory copies so setting the limit to Integer.MAX_VALUE
       final int maxNumComponents = Integer.MAX_VALUE;
-      if (tryZeroCopyWrite) {
-        bb = new ArrowBufRetainingCompositeByteBuf(maxNumComponents, byteBufs, bufs);
-      } else {
-        // Don't retain the buffers in the non-zero-copy path since we're copying them
-        bb =
-            new CompositeByteBuf(
-                UnpooledByteBufAllocator.DEFAULT, /* direct */ true, maxNumComponents, byteBufs);
-      }
+      // Retain the body buffers even when they will be copied: gRPC may not read the stream until
+      // after this message is closed.
+      final CompositeByteBuf bb =
+          new ArrowBufRetainingCompositeByteBuf(maxNumComponents, byteBufs, bufs);
       return new DrainableByteBufInputStream(bb, tryZeroCopyWrite);
     } catch (Exception ex) {
       throw new RuntimeException("Unexpected IO Exception", ex);
+    }
+  }
+
+  /** Fail if a buffer to be serialized has been freed, rather than reading freed memory. */
+  private static void checkAlive(ArrowBuf buf) {
+    if (buf != null && buf.getReferenceManager().getRefCount() == 0) {
+      throw new IllegalStateException(
+          "Cannot serialize a Flight message whose buffers have been freed. This can happen if "
+              + "gRPC retries a call after the message was written.");
     }
   }
 
@@ -570,6 +586,10 @@ class ArrowMessage implements AutoCloseable {
    *
    * <p>This class solves that issue by bridging Arrow and Netty/gRPC. We increment the refcnt on a
    * set of Arrow backing buffers and decrement them once the Netty buffers are freed by gRPC.
+   *
+   * <p>The same holds without zero-copy: gRPC copies the buffers when it reads the stream, which
+   * can be after the message was closed (see {@link #asInputStream()}), so it is used for every
+   * message with a body.
    */
   private static final class ArrowBufRetainingCompositeByteBuf extends CompositeByteBuf {
     // Arrow buffers that back the Netty ByteBufs here; ByteBufs held by this class are
