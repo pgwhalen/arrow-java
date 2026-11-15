@@ -520,14 +520,20 @@ public class FlightClient implements AutoCloseable {
 
     @Override
     public void onError(Throwable t) {
-      compressedBodies.callEnded();
-      delegate.onError(t);
+      try {
+        compressedBodies.callEnded();
+      } finally {
+        delegate.onError(t);
+      }
     }
 
     @Override
     public void onCompleted() {
-      compressedBodies.callEnded();
-      delegate.onCompleted();
+      try {
+        compressedBodies.callEnded();
+      } finally {
+        delegate.onCompleted();
+      }
     }
   }
 

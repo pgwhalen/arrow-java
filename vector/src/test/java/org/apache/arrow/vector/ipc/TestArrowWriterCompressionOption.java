@@ -18,7 +18,6 @@ package org.apache.arrow.vector.ipc;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -335,50 +334,65 @@ public class TestArrowWriterCompressionOption extends BaseFileTest {
   }
 
   /**
-   * The explicit-codec constructors validate the codec like {@link IpcOption#withCompression}: they
-   * previously wrote compressed bodies with V4 metadata or the legacy format.
+   * As in C++, compression works with V4 metadata and the legacy format, which only change the
+   * header's version and the message prefix. The explicit-codec constructors accepted these before
+   * {@link IpcOption} carried compression, and still do; an option that compresses works the same.
    */
   @Test
-  public void testExplicitCompressionRejectedForV4AndLegacyFormat() {
-    try (VectorSchemaRoot root = createRoot()) {
-      ByteArrayOutputStream out = new ByteArrayOutputStream();
-      for (IpcOption option :
-          List.of(
-              new IpcOption(false, MetadataVersion.V4),
-              new IpcOption(true, MetadataVersion.V4),
-              new IpcOption(true, MetadataVersion.V5))) {
-        assertThrows(
-            IllegalArgumentException.class,
-            () ->
-                new ArrowStreamWriter(
-                    root,
-                    null,
-                    Channels.newChannel(out),
-                    option,
-                    IDENTITY_FACTORY,
-                    CodecType.ZSTD));
-        assertThrows(
-            IllegalArgumentException.class,
-            () ->
-                new ArrowFileWriter(
-                    root,
-                    null,
-                    Channels.newChannel(out),
-                    null,
-                    option,
-                    IDENTITY_FACTORY,
-                    CodecType.ZSTD,
-                    Optional.of(3)));
+  public void testCompressionWithV4AndLegacyFormat() throws IOException {
+    for (IpcOption base :
+        List.of(
+            new IpcOption(false, MetadataVersion.V4),
+            new IpcOption(true, MetadataVersion.V4),
+            new IpcOption(true, MetadataVersion.V5))) {
+      final String expected =
+          org.apache.arrow.flatbuf.MetadataVersion.name(base.metadataVersion.toFlatbufID()) + "/1";
+      for (IpcOption option : List.of(base, base.withCompression(CodecType.ZSTD, 3))) {
+        byte[] stream =
+            write(
+                (root, out) ->
+                    new ArrowStreamWriter(
+                        root,
+                        null,
+                        Channels.newChannel(out),
+                        option,
+                        IDENTITY_FACTORY,
+                        CodecType.ZSTD,
+                        Optional.of(3)));
+        assertEquals(List.of(expected, expected), describeRecordBatches(stream));
+        try (ArrowStreamReader reader =
+            new ArrowStreamReader(new ByteArrayInputStream(stream), allocator, IDENTITY_FACTORY)) {
+          assertTrue(reader.loadNextBatch());
+          assertEquals(2, ((IntVector) reader.getVectorSchemaRoot().getVector(0)).get(1));
+        }
+
+        byte[] file =
+            write(
+                (root, out) ->
+                    new ArrowFileWriter(
+                        root,
+                        null,
+                        Channels.newChannel(out),
+                        null,
+                        option,
+                        IDENTITY_FACTORY,
+                        CodecType.ZSTD));
+        try (ArrowFileReader reader =
+            new ArrowFileReader(
+                new ByteArrayReadableSeekableByteChannel(file), allocator, IDENTITY_FACTORY)) {
+          assertTrue(reader.loadNextBatch());
+          assertEquals(3, ((IntVector) reader.getVectorSchemaRoot().getVector(0)).get(2));
+        }
       }
     }
   }
 
   /**
-   * An explicit level is dropped where it has no effect, as before {@link IpcOption} carried
-   * compression, rather than rejected as {@link IpcOption#withCompression} rejects it.
+   * A level is passed to the factory for every codec, which decides what it means, as before {@link
+   * IpcOption} carried compression. A level from the option is passed the same way.
    */
   @Test
-  public void testExplicitLevelWithoutEffectIsDropped() throws IOException {
+  public void testLevelPassedToFactoryForAnyCodec() throws IOException {
     List<String> created = new ArrayList<>();
     CompressionCodec.Factory recordingFactory =
         new CompressionCodec.Factory() {
@@ -407,8 +421,16 @@ public class TestArrowWriterCompressionOption extends BaseFileTest {
                 Optional.of(1))
             .close();
       }
+      new ArrowStreamWriter(
+              root,
+              null,
+              Channels.newChannel(out),
+              IpcOption.DEFAULT.withCompression(CodecType.LZ4_FRAME, 2),
+              recordingFactory,
+              CodecType.LZ4_FRAME)
+          .close();
     }
-    assertEquals(List.of("LZ4_FRAME", "NO_COMPRESSION"), created);
+    assertEquals(List.of("LZ4_FRAME/1", "NO_COMPRESSION/1", "LZ4_FRAME/2"), created);
   }
 
   @Test
@@ -451,39 +473,5 @@ public class TestArrowWriterCompressionOption extends BaseFileTest {
       assertTrue(reader.loadNextBatch());
       assertEquals(3, ((IntVector) reader.getVectorSchemaRoot().getVector(0)).get(2));
     }
-  }
-
-  /**
-   * Regression test: body compression is a V5 feature, so an option that requests compression
-   * cannot be combined with V4 metadata or the legacy format. Previously {@code new
-   * IpcOption(false, V4).withCompression(ZSTD)} was accepted and the writers produced record
-   * batches stamped V4 that nevertheless carried a body compression field and length-prefixed
-   * (compressed) buffers.
-   */
-  @Test
-  public void testCompressionRejectedForV4AndLegacyFormat() throws IOException {
-    for (IpcOption base :
-        List.of(
-            new IpcOption(false, MetadataVersion.V4),
-            new IpcOption(true, MetadataVersion.V4),
-            new IpcOption(true, MetadataVersion.V5))) {
-      IllegalArgumentException e =
-          assertThrows(IllegalArgumentException.class, () -> base.withCompression(CodecType.ZSTD));
-      assertNotNull(e.getMessage());
-      assertThrows(IllegalArgumentException.class, () -> base.withCompression(CodecType.ZSTD, 1));
-    }
-
-    // With V5 and the current format, the same writer output is stamped V5.
-    byte[] stream =
-        write(
-            (root, out) ->
-                new ArrowStreamWriter(
-                    root,
-                    null,
-                    Channels.newChannel(out),
-                    new IpcOption(false, MetadataVersion.V5).withCompression(CodecType.ZSTD),
-                    IDENTITY_FACTORY,
-                    CodecType.ZSTD));
-    assertEquals(List.of("V5/1", "V5/1"), describeRecordBatches(stream));
   }
 }

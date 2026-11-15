@@ -220,5 +220,6 @@ PyArrow's ``pa.ipc.IpcWriteOptions(compression="zstd")``.
     }
 
 Codecs are provided by the ``arrow-compression`` module, which must be on the classpath of writers
-and readers; readers decompress automatically. Body compression is part of metadata version V5, so
-it cannot be combined with ``MetadataVersion.V4`` or the legacy (pre-0.15.0) IPC format.
+and readers; readers decompress automatically. A compression level is passed to the codec factory,
+which decides what it means: the ``arrow-compression`` codecs use it for ZSTD and ignore it for
+LZ4_FRAME.

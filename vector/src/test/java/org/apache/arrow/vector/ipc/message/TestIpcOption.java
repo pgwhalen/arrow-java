@@ -19,7 +19,6 @@ package org.apache.arrow.vector.ipc.message;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Optional;
 import org.apache.arrow.vector.compression.CompressionUtil.CodecType;
@@ -63,53 +62,34 @@ public class TestIpcOption {
     assertEquals(CodecType.ZSTD, zstd.codecType);
   }
 
+  /**
+   * As in C++, compression combines with any metadata version and IPC format, and keeps them as
+   * they are.
+   */
   @Test
-  public void testCompressionRequiresV5() {
-    final IpcOption v4 = new IpcOption(false, MetadataVersion.V4);
-    IllegalArgumentException e =
-        assertThrows(IllegalArgumentException.class, () -> v4.withCompression(CodecType.ZSTD));
-    assertTrue(e.getMessage().contains("V5"), e.getMessage());
-    assertThrows(IllegalArgumentException.class, () -> v4.withCompression(CodecType.ZSTD, 1));
-
-    // Disabling compression is always allowed
-    assertEquals(CodecType.NO_COMPRESSION, v4.withCompression(CodecType.NO_COMPRESSION).codecType);
+  public void testCompressionWithV4AndLegacyFormat() {
+    for (IpcOption base :
+        new IpcOption[] {
+          new IpcOption(false, MetadataVersion.V4),
+          new IpcOption(true, MetadataVersion.V5),
+          new IpcOption(true, MetadataVersion.V4)
+        }) {
+      final IpcOption zstd = base.withCompression(CodecType.ZSTD, 1);
+      assertEquals(CodecType.ZSTD, zstd.codecType);
+      assertEquals(Optional.of(1), zstd.compressionLevel);
+      assertEquals(base.metadataVersion, zstd.metadataVersion);
+      assertEquals(base.write_legacy_ipc_format, zstd.write_legacy_ipc_format);
+    }
   }
 
+  /** A level is kept for any codec; the codec factory decides what it means. */
   @Test
-  public void testCompressionRejectsLegacyFormat() {
-    final IpcOption legacy = new IpcOption(true, MetadataVersion.V5);
-    IllegalArgumentException e =
-        assertThrows(IllegalArgumentException.class, () -> legacy.withCompression(CodecType.ZSTD));
-    assertTrue(e.getMessage().contains("legacy"), e.getMessage());
-    assertThrows(IllegalArgumentException.class, () -> legacy.withCompression(CodecType.ZSTD, 1));
-    assertThrows(
-        IllegalArgumentException.class,
-        () -> new IpcOption(true, MetadataVersion.V4).withCompression(CodecType.ZSTD));
-
-    assertEquals(
-        CodecType.NO_COMPRESSION, legacy.withCompression(CodecType.NO_COMPRESSION).codecType);
-  }
-
-  @Test
-  public void testLevelRejectedForNoCompression() {
-    IllegalArgumentException e =
-        assertThrows(
-            IllegalArgumentException.class,
-            () -> IpcOption.DEFAULT.withCompression(CodecType.NO_COMPRESSION, 3));
-    assertTrue(e.getMessage().contains("NO_COMPRESSION"), e.getMessage());
-  }
-
-  /** LZ4_FRAME has no level: one would be silently ignored, so it is rejected. */
-  @Test
-  public void testLevelRejectedForLz4() {
-    IllegalArgumentException e =
-        assertThrows(
-            IllegalArgumentException.class,
-            () -> IpcOption.DEFAULT.withCompression(CodecType.LZ4_FRAME, 3));
-    assertTrue(e.getMessage().contains("LZ4_FRAME"), e.getMessage());
-    assertTrue(IpcOption.supportsCompressionLevel(CodecType.ZSTD));
-    assertFalse(IpcOption.supportsCompressionLevel(CodecType.LZ4_FRAME));
-    assertFalse(IpcOption.supportsCompressionLevel(CodecType.NO_COMPRESSION));
+  public void testLevelKeptForAnyCodec() {
+    for (CodecType codecType : CodecType.values()) {
+      final IpcOption option = IpcOption.DEFAULT.withCompression(codecType, 3);
+      assertEquals(codecType, option.codecType);
+      assertEquals(Optional.of(3), option.compressionLevel);
+    }
   }
 
   @Test

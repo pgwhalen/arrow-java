@@ -56,9 +56,6 @@ public abstract class ArrowWriter implements AutoCloseable {
   private final DictionaryProvider dictionaryProvider;
   private final Set<Long> dictionaryIdsUsed = new HashSet<>();
 
-  private final CompressionCodec.Factory compressionFactory;
-  private final CompressionUtil.CodecType codecType;
-  private final Optional<Integer> compressionLevel;
   private boolean started = false;
   private boolean ended = false;
 
@@ -113,8 +110,7 @@ public abstract class ArrowWriter implements AutoCloseable {
    * @param codecType Compression codec
    * @param compressionLevel Compression level
    * @throws IllegalArgumentException if {@code option} requests compression with a codec other than
-   *     {@code codecType}, or with a level other than a present {@code compressionLevel}; or if
-   *     compression is requested with metadata before V5 or the legacy IPC format
+   *     {@code codecType}, or with a level other than a present {@code compressionLevel}
    */
   protected ArrowWriter(
       VectorSchemaRoot root,
@@ -127,10 +123,6 @@ public abstract class ArrowWriter implements AutoCloseable {
     this.out = new WriteChannel(out);
     this.option = withExplicitCompression(option, codecType, compressionLevel);
     this.dictionaryProvider = provider;
-
-    this.compressionFactory = compressionFactory;
-    this.codecType = this.option.codecType;
-    this.compressionLevel = this.option.compressionLevel;
     this.codec = CompressionUtil.createCodec(compressionFactory, this.option);
     this.unloader =
         new VectorUnloader(root, /*includeNullCount*/ true, codec, /*alignBuffers*/ true);
@@ -149,15 +141,14 @@ public abstract class ArrowWriter implements AutoCloseable {
 
   /**
    * The options a writer uses: {@code option} with the explicitly passed codec and level, so that
-   * the option is the single source of truth, and {@link IpcOption#withCompression} validates the
-   * codec in every case.
+   * the option is the single source of truth.
    *
    * <ul>
    *   <li>If the option does not request compression, the explicit codec applies.
    *   <li>Otherwise the explicit codec must be the option's.
    *   <li>The explicit level applies if present, else the option's; two different levels conflict.
-   *   <li>A level is dropped where it has no effect (no compression, or LZ4_FRAME), as writers did
-   *       before {@link IpcOption} carried compression.
+   *       The level is passed to the factory as is, as these constructors did before {@link
+   *       IpcOption} carried compression.
    * </ul>
    */
   private static IpcOption withExplicitCompression(
@@ -178,13 +169,9 @@ public abstract class ArrowWriter implements AutoCloseable {
               + " and level "
               + compressionLevel);
     }
-    if (codecType == CompressionUtil.CodecType.NO_COMPRESSION) {
-      // Neither side compresses: the option applies as given.
-      return option;
-    }
     final Optional<Integer> level =
         compressionLevel.isPresent() ? compressionLevel : option.compressionLevel;
-    return level.isPresent() && IpcOption.supportsCompressionLevel(codecType)
+    return level.isPresent()
         ? option.withCompression(codecType, level.get())
         : option.withCompression(codecType);
   }
