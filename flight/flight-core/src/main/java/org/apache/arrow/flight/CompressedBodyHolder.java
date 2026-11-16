@@ -24,12 +24,11 @@ import org.apache.arrow.memory.ArrowBuf;
  * Keeps the compressed bodies of the messages a Flight client has sent alive for as long as the
  * corresponding uncompressed bodies would be.
  *
- * <p>A gRPC client call may serialize a message object after it was handed over and closed: it
- * queues messages until the call is connected, and replays them when it retries the call
- * transparently. An uncompressed body is a view of the writer's vectors, which keep it alive: the
- * record batch until the writer refills the root, and the dictionaries for the whole stream. A
- * compressed body is owned by the message alone, so this holder takes a reference to it in their
- * place:
+ * <p>A gRPC client call may serialize a message object after the writer has handed it over and
+ * closed it, e.g. while the call is not yet connected. An uncompressed body is a view of the
+ * writer's vectors, which keep it alive: the record batch until the writer refills the root, and
+ * the dictionaries for the whole stream. A compressed body is owned by the message alone, so this
+ * holder takes a reference to it in their place:
  *
  * <ul>
  *   <li>a record batch's until the next record batch is sent, by which time the writer has refilled
@@ -37,8 +36,10 @@ import org.apache.arrow.memory.ArrowBuf;
  *   <li>a dictionary batch's until the call ends.
  * </ul>
  *
- * <p>Everything is released when the call ends, after which gRPC no longer serializes messages.
- * Servers do not need this: a server call serializes each message as it is sent.
+ * <p>This only makes compressed bodies live as long as uncompressed ones; it does not address
+ * messages that gRPC serializes after their uncompressed bodies are gone (e.g. on a retry), which
+ * affects both alike. Everything is released when the call ends. Servers do not need this: a server
+ * call serializes each message as it is sent.
  */
 final class CompressedBodyHolder {
   private final List<ArrowBuf> dictionaries = new ArrayList<>();

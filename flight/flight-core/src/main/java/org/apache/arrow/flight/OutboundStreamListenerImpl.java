@@ -96,9 +96,12 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
     }
 
     waitUntilStreamReady();
-    // The message's own references are not needed once it is sent: the serialized stream takes
-    // its own, and a client keeps compressed bodies alive in case gRPC serializes the message
-    // later (see sent()). If sending fails, closing frees the batch.
+    // close is a no-op if the message has been written to gRPC, otherwise frees the associated
+    // buffers
+    // in some code paths (e.g. if the call is cancelled), gRPC does not write the message, so we
+    // need to clean up
+    // ourselves. Normally, writing the ArrowMessage will transfer ownership of the data to
+    // gRPC/Netty.
     try (final ArrowMessage message =
         new ArrowMessage(unloader.getRecordBatch(), metadata, tryZeroCopy, option)) {
       send(message);
