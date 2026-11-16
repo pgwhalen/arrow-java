@@ -16,11 +16,13 @@
  */
 package org.apache.arrow.vector.compression;
 
+import java.util.Optional;
 import org.apache.arrow.flatbuf.BodyCompressionMethod;
 import org.apache.arrow.flatbuf.CompressionType;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.ipc.message.ArrowBodyCompression;
+import org.apache.arrow.vector.ipc.message.IpcOption;
 
 /** Utilities for data compression/decompression. */
 public class CompressionUtil {
@@ -89,5 +91,54 @@ public class CompressionUtil {
   public static ArrowBuf extractUncompressedBuffer(ArrowBuf inputBuffer) {
     return inputBuffer.slice(
         SIZE_OF_UNCOMPRESSED_LENGTH, inputBuffer.writerIndex() - SIZE_OF_UNCOMPRESSED_LENGTH);
+  }
+
+  /**
+   * The factory to create a codec of the given type with by default: {@link
+   * NoCompressionCodec.Factory#INSTANCE} for {@link CodecType#NO_COMPRESSION}, so that writing
+   * without compression never depends on the codecs on the classpath, and {@link
+   * CompressionCodec.Factory#INSTANCE} otherwise.
+   */
+  public static CompressionCodec.Factory defaultFactory(CodecType codecType) {
+    return codecType == CodecType.NO_COMPRESSION
+        ? NoCompressionCodec.Factory.INSTANCE
+        : CompressionCodec.Factory.INSTANCE;
+  }
+
+  /**
+   * Creates a codec from the given factory, using the compression level if present and the codec's
+   * default level otherwise.
+   *
+   * @param factory the factory that creates the codec
+   * @param codecType the codec type
+   * @param compressionLevel the codec-specific compression level, or empty for the default
+   * @return the codec
+   */
+  private static CompressionCodec createCodec(
+      CompressionCodec.Factory factory, CodecType codecType, Optional<Integer> compressionLevel) {
+    return compressionLevel.isPresent()
+        ? factory.createCodec(codecType, compressionLevel.get())
+        : factory.createCodec(codecType);
+  }
+
+  /**
+   * Creates the codec that {@code option} requests, from {@link #defaultFactory}.
+   *
+   * @param option the IPC options naming the codec and level
+   * @return the codec; a no-op codec if the option does not request compression
+   */
+  public static CompressionCodec createCodec(IpcOption option) {
+    return createCodec(defaultFactory(option.codecType), option);
+  }
+
+  /**
+   * Creates the codec that {@code option} requests, from the given factory.
+   *
+   * @param factory the factory that creates the codec
+   * @param option the IPC options naming the codec and level
+   * @return the codec
+   */
+  public static CompressionCodec createCodec(CompressionCodec.Factory factory, IpcOption option) {
+    return createCodec(factory, option.codecType, option.compressionLevel);
   }
 }

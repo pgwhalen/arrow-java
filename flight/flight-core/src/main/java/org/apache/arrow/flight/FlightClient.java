@@ -263,11 +263,17 @@ public class FlightClient implements AutoCloseable {
       final ClientCall<ArrowMessage, Flight.PutResult> call =
           asyncStubNewCall(doPutDescriptor, options);
       final SetStreamObserver resultObserver = new SetStreamObserver(allocator, metadataListener);
+      final CompressedBodyHolder compressedBodies = new CompressedBodyHolder();
       ClientCallStreamObserver<ArrowMessage> observer =
           (ClientCallStreamObserver<ArrowMessage>)
-              ClientCalls.asyncBidiStreamingCall(call, resultObserver);
+              ClientCalls.asyncBidiStreamingCall(
+                  call, new CallEndObserver<>(resultObserver, compressedBodies));
       return new PutObserver(
-          descriptor, observer, metadataListener::isCancelled, metadataListener::getResult);
+          descriptor,
+          observer,
+          compressedBodies,
+          metadataListener::isCancelled,
+          metadataListener::getResult);
     } catch (StatusRuntimeException sre) {
       throw StatusUtils.fromGrpcRuntimeException(sre);
     }
@@ -386,13 +392,16 @@ public class FlightClient implements AutoCloseable {
           asyncStubNewCall(doExchangeDescriptor, options);
       final FlightStream stream =
           new FlightStream(allocator, PENDING_REQUESTS, call::cancel, call::request);
+      final CompressedBodyHolder compressedBodies = new CompressedBodyHolder();
       final ClientCallStreamObserver<ArrowMessage> observer =
           (ClientCallStreamObserver<ArrowMessage>)
-              ClientCalls.asyncBidiStreamingCall(call, stream.asObserver());
+              ClientCalls.asyncBidiStreamingCall(
+                  call, new CallEndObserver<>(stream.asObserver(), compressedBodies));
       final ClientStreamListener writer =
           new PutObserver(
               descriptor,
               observer,
+              compressedBodies,
               stream.cancelled::isDone,
               () -> {
                 try {
@@ -491,8 +500,46 @@ public class FlightClient implements AutoCloseable {
     }
   }
 
+  /**
+   * Releases a call's {@link CompressedBodyHolder} when the call ends, before passing the end on,
+   * so that compressed bodies are freed by the time the caller learns that the call is over.
+   */
+  private static final class CallEndObserver<T> implements StreamObserver<T> {
+    private final StreamObserver<T> delegate;
+    private final CompressedBodyHolder compressedBodies;
+
+    CallEndObserver(StreamObserver<T> delegate, CompressedBodyHolder compressedBodies) {
+      this.delegate = delegate;
+      this.compressedBodies = compressedBodies;
+    }
+
+    @Override
+    public void onNext(T value) {
+      delegate.onNext(value);
+    }
+
+    @Override
+    public void onError(Throwable t) {
+      try {
+        compressedBodies.callEnded();
+      } finally {
+        delegate.onError(t);
+      }
+    }
+
+    @Override
+    public void onCompleted() {
+      try {
+        compressedBodies.callEnded();
+      } finally {
+        delegate.onCompleted();
+      }
+    }
+  }
+
   /** The implementation of a {@link ClientStreamListener} for writing data to a Flight server. */
   static class PutObserver extends OutboundStreamListenerImpl implements ClientStreamListener {
+    private final CompressedBodyHolder compressedBodies;
     private final BooleanSupplier isCancelled;
     private final Runnable getResult;
 
@@ -501,18 +548,23 @@ public class FlightClient implements AutoCloseable {
      *
      * @param descriptor The descriptor for the stream.
      * @param observer The write-side gRPC StreamObserver.
+     * @param compressedBodies Holds compressed bodies until gRPC no longer serializes them; the
+     *     call's read side must release it when the call ends.
      * @param isCancelled A flag to check if the call has been cancelled.
      * @param getResult A flag that blocks until the overall call completes.
      */
     PutObserver(
         FlightDescriptor descriptor,
         ClientCallStreamObserver<ArrowMessage> observer,
+        CompressedBodyHolder compressedBodies,
         BooleanSupplier isCancelled,
         Runnable getResult) {
       super(descriptor, observer);
+      Preconditions.checkNotNull(compressedBodies, "compressedBodies must be provided");
       Preconditions.checkNotNull(descriptor, "descriptor must be provided");
       Preconditions.checkNotNull(isCancelled, "isCancelled must be provided");
       Preconditions.checkNotNull(getResult, "getResult must be provided");
+      this.compressedBodies = compressedBodies;
       this.isCancelled = isCancelled;
       this.getResult = getResult;
       this.unloader = null;
@@ -525,6 +577,11 @@ public class FlightClient implements AutoCloseable {
       while (!responseObserver.isReady() && !isCancelled.getAsBoolean()) {
         /* busy wait */
       }
+    }
+
+    @Override
+    protected void sent(ArrowMessage message) {
+      compressedBodies.sent(message);
     }
 
     @Override

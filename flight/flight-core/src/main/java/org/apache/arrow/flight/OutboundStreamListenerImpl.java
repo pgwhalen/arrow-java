@@ -22,6 +22,8 @@ import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
+import org.apache.arrow.vector.compression.CompressionCodec;
+import org.apache.arrow.vector.compression.CompressionUtil;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.ipc.message.IpcOption;
 
@@ -54,9 +56,10 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
   @Override
   public void start(VectorSchemaRoot root, DictionaryProvider dictionaries, IpcOption option) {
     this.option = option;
+    final CompressionCodec codec = CompressionUtil.createCodec(option);
     try {
       DictionaryUtils.generateSchemaMessages(
-          root.getSchema(), descriptor, dictionaries, option, responseObserver::onNext);
+          root.getSchema(), descriptor, dictionaries, option, codec, this::send);
     } catch (RuntimeException e) {
       // Propagate runtime exceptions, like those raised when trying to write unions with V4
       // metadata
@@ -68,7 +71,8 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
       throw new RuntimeException("Could not generate and send all schema messages", e);
     }
     // We include the null count and align buffers to be compatible with Flight/C++
-    unloader = new VectorUnloader(root, /* includeNullCount */ true, /* alignBuffers */ true);
+    unloader =
+        new VectorUnloader(root, /* includeNullCount */ true, codec, /* alignBuffers */ true);
   }
 
   @Override
@@ -100,7 +104,7 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
     // gRPC/Netty.
     try (final ArrowMessage message =
         new ArrowMessage(unloader.getRecordBatch(), metadata, tryZeroCopy, option)) {
-      responseObserver.onNext(message);
+      send(message);
     } catch (Exception e) {
       // This exception comes from ArrowMessage#close, not responseObserver#onNext.
       // Generally this should not happen - ArrowMessage's implementation only closes non-throwing
@@ -111,6 +115,19 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
       throw new RuntimeException("Could not free ArrowMessage", e);
     }
   }
+
+  private void send(ArrowMessage message) {
+    responseObserver.onNext(message);
+    sent(message);
+  }
+
+  /**
+   * Called after a message is handed to gRPC, before it is closed.
+   *
+   * <p>Overridden by clients, where gRPC may serialize the message later (see {@link
+   * CompressedBodyHolder}).
+   */
+  protected void sent(ArrowMessage message) {}
 
   @Override
   public void putMetadata(ArrowBuf metadata) {

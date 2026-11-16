@@ -29,7 +29,6 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.compression.CompressionCodec;
 import org.apache.arrow.vector.compression.CompressionUtil;
-import org.apache.arrow.vector.compression.NoCompressionCodec;
 import org.apache.arrow.vector.dictionary.Dictionary;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.ipc.message.ArrowBlock;
@@ -57,9 +56,6 @@ public abstract class ArrowWriter implements AutoCloseable {
   private final DictionaryProvider dictionaryProvider;
   private final Set<Long> dictionaryIdsUsed = new HashSet<>();
 
-  private final CompressionCodec.Factory compressionFactory;
-  private final CompressionUtil.CodecType codecType;
-  private final Optional<Integer> compressionLevel;
   private boolean started = false;
   private boolean ended = false;
 
@@ -72,6 +68,19 @@ public abstract class ArrowWriter implements AutoCloseable {
     this(root, provider, out, IpcOption.DEFAULT);
   }
 
+  /**
+   * Note: fields are not closed when the writer is closed.
+   *
+   * <p>If {@code option} requests body compression (see {@link
+   * IpcOption#withCompression(CompressionUtil.CodecType)}), the codec is obtained from {@link
+   * CompressionCodec.Factory#INSTANCE}, which requires a codec implementation such as the {@code
+   * arrow-compression} module on the classpath; otherwise creating the writer fails.
+   *
+   * @param root the vectors to write to the output
+   * @param provider where to find the dictionaries
+   * @param out the output where to write
+   * @param option IPC write options
+   */
   protected ArrowWriter(
       VectorSchemaRoot root,
       DictionaryProvider provider,
@@ -82,13 +91,16 @@ public abstract class ArrowWriter implements AutoCloseable {
         provider,
         out,
         option,
-        NoCompressionCodec.Factory.INSTANCE,
-        CompressionUtil.CodecType.NO_COMPRESSION,
-        Optional.empty());
+        CompressionUtil.defaultFactory(option.codecType),
+        option.codecType,
+        option.compressionLevel);
   }
 
   /**
    * Note: fields are not closed when the writer is closed.
+   *
+   * <p>The codec and level are combined with {@code option} into the options this writer uses (see
+   * {@link #withExplicitCompression}), and the codec is created with {@code compressionFactory}.
    *
    * @param root the vectors to write to the output
    * @param provider where to find the dictionaries
@@ -97,6 +109,8 @@ public abstract class ArrowWriter implements AutoCloseable {
    * @param compressionFactory Compression codec factory
    * @param codecType Compression codec
    * @param compressionLevel Compression level
+   * @throws IllegalArgumentException if {@code option} requests compression with a codec other than
+   *     {@code codecType}, or with a level other than a present {@code compressionLevel}
    */
   protected ArrowWriter(
       VectorSchemaRoot root,
@@ -107,29 +121,59 @@ public abstract class ArrowWriter implements AutoCloseable {
       CompressionUtil.CodecType codecType,
       Optional<Integer> compressionLevel) {
     this.out = new WriteChannel(out);
-    this.option = option;
+    this.option = withExplicitCompression(option, codecType, compressionLevel);
     this.dictionaryProvider = provider;
-
-    this.compressionFactory = compressionFactory;
-    this.codecType = codecType;
-    this.compressionLevel = compressionLevel;
-    this.codec =
-        this.compressionLevel.isPresent()
-            ? this.compressionFactory.createCodec(this.codecType, this.compressionLevel.get())
-            : this.compressionFactory.createCodec(this.codecType);
+    this.codec = CompressionUtil.createCodec(compressionFactory, this.option);
     this.unloader =
         new VectorUnloader(root, /*includeNullCount*/ true, codec, /*alignBuffers*/ true);
 
     List<Field> fields = new ArrayList<>(root.getSchema().getFields().size());
 
     MetadataV4UnionChecker.checkForUnion(
-        root.getSchema().getFields().iterator(), option.metadataVersion);
+        root.getSchema().getFields().iterator(), this.option.metadataVersion);
     // Convert fields with dictionaries to have dictionary type
     for (Field field : root.getSchema().getFields()) {
       fields.add(DictionaryUtility.toMessageFormat(field, provider, dictionaryIdsUsed));
     }
 
     this.schema = new Schema(fields, root.getSchema().getCustomMetadata());
+  }
+
+  /**
+   * The options a writer uses: {@code option} with the explicitly passed codec and level, so that
+   * the option is the single source of truth.
+   *
+   * <ul>
+   *   <li>If the option does not request compression, the explicit codec applies.
+   *   <li>Otherwise the explicit codec must be the option's.
+   *   <li>The explicit level applies if present, else the option's; two different levels conflict.
+   *       The level is passed to the factory as is, as these constructors did before {@link
+   *       IpcOption} carried compression.
+   * </ul>
+   */
+  private static IpcOption withExplicitCompression(
+      IpcOption option, CompressionUtil.CodecType codecType, Optional<Integer> compressionLevel) {
+    final boolean optionCompresses = option.codecType != CompressionUtil.CodecType.NO_COMPRESSION;
+    final boolean levelsConflict =
+        compressionLevel.isPresent()
+            && option.compressionLevel.isPresent()
+            && !compressionLevel.equals(option.compressionLevel);
+    if (optionCompresses && (option.codecType != codecType || levelsConflict)) {
+      throw new IllegalArgumentException(
+          "IpcOption requests compression with codec "
+              + option.codecType
+              + " and level "
+              + option.compressionLevel
+              + ", which conflicts with the explicitly passed codec "
+              + codecType
+              + " and level "
+              + compressionLevel);
+    }
+    final Optional<Integer> level =
+        compressionLevel.isPresent() ? compressionLevel : option.compressionLevel;
+    return level.isPresent()
+        ? option.withCompression(codecType, level.get())
+        : option.withCompression(codecType);
   }
 
   public void start() throws IOException {

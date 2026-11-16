@@ -48,6 +48,7 @@ import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.util.Preconditions;
+import org.apache.arrow.vector.compression.NoCompressionCodec;
 import org.apache.arrow.vector.ipc.message.ArrowDictionaryBatch;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.ipc.message.IpcOption;
@@ -142,6 +143,9 @@ class ArrowMessage implements AutoCloseable {
   private final MessageMetadataResult message;
   private final ArrowBuf appMetadata;
   private final List<ArrowBuf> bufs;
+  // Whether the body buffers are compressed, i.e. owned by this message alone; see
+  // getCompressedBody().
+  private final boolean compressed;
   private final boolean tryZeroCopyWrite;
 
   public ArrowMessage(FlightDescriptor descriptor, Schema schema, IpcOption option) {
@@ -152,6 +156,7 @@ class ArrowMessage implements AutoCloseable {
     bufs = ImmutableList.of();
     this.descriptor = descriptor;
     this.appMetadata = null;
+    this.compressed = false;
     this.tryZeroCopyWrite = false;
   }
 
@@ -169,6 +174,7 @@ class ArrowMessage implements AutoCloseable {
     this.message =
         MessageMetadataResult.create(serializedMessage.slice(), serializedMessage.remaining());
     this.bufs = ImmutableList.copyOf(batch.getBuffers());
+    this.compressed = isCompressed(batch);
     this.descriptor = null;
     this.appMetadata = appMetadata;
     this.tryZeroCopyWrite = tryZeroCopy;
@@ -184,6 +190,7 @@ class ArrowMessage implements AutoCloseable {
     this.bufs = ImmutableList.copyOf(batch.getDictionary().getBuffers());
     this.descriptor = null;
     this.appMetadata = null;
+    this.compressed = isCompressed(batch.getDictionary());
     this.tryZeroCopyWrite = false;
   }
 
@@ -199,6 +206,7 @@ class ArrowMessage implements AutoCloseable {
     this.bufs = ImmutableList.of();
     this.descriptor = null;
     this.appMetadata = appMetadata;
+    this.compressed = false;
     this.tryZeroCopyWrite = false;
   }
 
@@ -209,6 +217,7 @@ class ArrowMessage implements AutoCloseable {
     this.bufs = ImmutableList.of();
     this.descriptor = descriptor;
     this.appMetadata = null;
+    this.compressed = false;
     this.tryZeroCopyWrite = false;
   }
 
@@ -228,7 +237,21 @@ class ArrowMessage implements AutoCloseable {
     this.descriptor = descriptor;
     this.appMetadata = appMetadata;
     this.bufs = buf == null ? ImmutableList.of() : ImmutableList.of(buf);
+    this.compressed = false;
     this.tryZeroCopyWrite = false;
+  }
+
+  private static boolean isCompressed(ArrowRecordBatch batch) {
+    return batch.getBodyCompression().getCodec() != NoCompressionCodec.COMPRESSION_TYPE;
+  }
+
+  /**
+   * The body buffers that only this message keeps alive: compressed buffers, which the codec
+   * allocated for this message. Empty for an uncompressed body, whose buffers belong to the
+   * writer's vectors.
+   */
+  List<ArrowBuf> getCompressedBody() {
+    return compressed ? bufs : ImmutableList.of();
   }
 
   public MessageMetadataResult asSchemaMessage() {
@@ -542,7 +565,9 @@ class ArrowMessage implements AutoCloseable {
       // large CompositeByteBuf we're creating here.
       // We never want additional memory copies so setting the limit to Integer.MAX_VALUE
       final int maxNumComponents = Integer.MAX_VALUE;
-      if (tryZeroCopyWrite) {
+      if (tryZeroCopyWrite || compressed) {
+        // A compressed body is owned by this message alone, which the writer closes once it is
+        // sent, so the stream must keep it alive until gRPC has read it, as with zero-copy.
         bb = new ArrowBufRetainingCompositeByteBuf(maxNumComponents, byteBufs, bufs);
       } else {
         // Don't retain the buffers in the non-zero-copy path since we're copying them
@@ -570,6 +595,9 @@ class ArrowMessage implements AutoCloseable {
    *
    * <p>This class solves that issue by bridging Arrow and Netty/gRPC. We increment the refcnt on a
    * set of Arrow backing buffers and decrement them once the Netty buffers are freed by gRPC.
+   *
+   * <p>It is also used for compressed bodies, which only the message owns (see {@link
+   * #asInputStream()}).
    */
   private static final class ArrowBufRetainingCompositeByteBuf extends CompositeByteBuf {
     // Arrow buffers that back the Netty ByteBufs here; ByteBufs held by this class are

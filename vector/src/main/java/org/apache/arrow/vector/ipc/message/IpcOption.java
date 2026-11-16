@@ -16,6 +16,9 @@
  */
 package org.apache.arrow.vector.ipc.message;
 
+import java.util.Optional;
+import org.apache.arrow.util.Preconditions;
+import org.apache.arrow.vector.compression.CompressionUtil;
 import org.apache.arrow.vector.types.MetadataVersion;
 
 /** IPC options, now only use for write. */
@@ -28,14 +31,66 @@ public class IpcOption {
   // The metadata version. Defaults to V5.
   public final MetadataVersion metadataVersion;
 
+  // The codec used to compress record batch and dictionary batch bodies. Defaults to
+  // NO_COMPRESSION.
+  public final CompressionUtil.CodecType codecType;
+
+  // The codec-specific compression level. Empty uses the codec's default.
+  public final Optional<Integer> compressionLevel;
+
   public IpcOption() {
     this(false, MetadataVersion.DEFAULT);
   }
 
+  /** Create options without body compression. */
   public IpcOption(boolean writeLegacyIpcFormat, MetadataVersion metadataVersion) {
+    this(
+        writeLegacyIpcFormat,
+        metadataVersion,
+        CompressionUtil.CodecType.NO_COMPRESSION,
+        Optional.empty());
+  }
+
+  private IpcOption(
+      boolean writeLegacyIpcFormat,
+      MetadataVersion metadataVersion,
+      CompressionUtil.CodecType codecType,
+      Optional<Integer> compressionLevel) {
     this.write_legacy_ipc_format = writeLegacyIpcFormat;
     this.metadataVersion = metadataVersion;
+    this.codecType = Preconditions.checkNotNull(codecType, "codecType must not be null");
+    this.compressionLevel = compressionLevel;
   }
 
   public static final IpcOption DEFAULT = new IpcOption();
+
+  /**
+   * Return a copy of these options that compresses record batch and dictionary batch bodies with
+   * the given codec, like {@code IpcWriteOptions::codec} in C++ and {@code
+   * IpcWriteOptions(compression=...)} in PyArrow.
+   *
+   * <p>Honored by {@link org.apache.arrow.vector.ipc.ArrowStreamWriter}, {@link
+   * org.apache.arrow.vector.ipc.ArrowFileWriter}, and Arrow Flight clients and servers. Requires a
+   * codec implementation (e.g. the {@code arrow-compression} module) at runtime. Passing {@code
+   * NO_COMPRESSION} disables compression.
+   *
+   * <p>As in C++, compression can be combined with any metadata version and IPC format: each
+   * compressed batch's header records its codec.
+   */
+  public IpcOption withCompression(CompressionUtil.CodecType codecType) {
+    return new IpcOption(write_legacy_ipc_format, metadataVersion, codecType, Optional.empty());
+  }
+
+  /**
+   * Like {@link #withCompression(CompressionUtil.CodecType)}, with a codec-specific level.
+   *
+   * <p>The level is passed to the {@link
+   * org.apache.arrow.vector.compression.CompressionCodec.Factory} that creates the codec, which
+   * decides what it means, as {@code Codec::Create} does in C++. The factories in {@code
+   * arrow-compression} use it for ZSTD and ignore it for LZ4_FRAME.
+   */
+  public IpcOption withCompression(CompressionUtil.CodecType codecType, int compressionLevel) {
+    return new IpcOption(
+        write_legacy_ipc_format, metadataVersion, codecType, Optional.of(compressionLevel));
+  }
 }

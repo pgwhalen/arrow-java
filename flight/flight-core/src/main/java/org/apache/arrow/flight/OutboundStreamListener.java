@@ -68,6 +68,9 @@ public interface OutboundStreamListener {
    * Start sending data, using the schema of the given {@link VectorSchemaRoot}.
    *
    * <p>This method must be called before all others, except {@link #putMetadata(ArrowBuf)}.
+   *
+   * <p>Record batch and dictionary batch bodies can be compressed by passing e.g. {@code
+   * IpcOption.DEFAULT.withCompression(CompressionUtil.CodecType.ZSTD)}.
    */
   void start(VectorSchemaRoot root, DictionaryProvider dictionaries, IpcOption option);
 
